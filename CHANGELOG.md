@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/simonwinther/breakd/compare/v0.1.0...v0.1.1) (2026-07-13)
+
+
+### Features
+
+* **settings, tray:** add new crates for settings and tray functionality ([c1cfaf7](https://github.com/simonwinther/breakd/commit/c1cfaf7b1b879c155830cbd80c4948c21b1c540b))
+
 ## 0.1.0 (2026-07-13)
 
 
