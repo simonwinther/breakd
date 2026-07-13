@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/simonwinther/breakd/compare/v0.1.2...v0.1.3) (2026-07-13)
+
+
+### Bug Fixes
+
+* **ci:** sync Cargo.lock on release pull requests ([a16b8e0](https://github.com/simonwinther/breakd/commit/a16b8e0410c192e7444c412d97a168910536fd9b))
+* **ci:** sync Cargo.lock on release pull requests ([ee64733](https://github.com/simonwinther/breakd/commit/ee64733cab88f8a517ace4d00b123ccad17b31aa))
+
 ## [0.1.2](https://github.com/simonwinther/breakd/compare/v0.1.1...v0.1.2) (2026-07-13)
 
 
