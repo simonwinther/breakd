@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/simonwinther/breakd/compare/v0.1.1...v0.1.2) (2026-07-13)
+
+
+### Features
+
+* **docs:** add third-party notices and update README with new features ([15c9dab](https://github.com/simonwinther/breakd/commit/15c9dab80bd363c064b8d02ee7bc8a23323d87e6))
+
 ## [0.1.1](https://github.com/simonwinther/breakd/compare/v0.1.0...v0.1.1) (2026-07-13)
 
 
