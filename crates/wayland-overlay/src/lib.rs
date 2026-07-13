@@ -20,8 +20,9 @@ pub fn run(spec: OverlaySpec, config: AppConfig) -> Result<(), String> {
         return Err("breakd overlay requires a Wayland session".into());
     }
 
+    let instance = breakd_config::RuntimeInstance::current();
     let application = gtk::Application::builder()
-        .application_id("io.github.breakd.Overlay")
+        .application_id(instance.overlay_application_id())
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
     application.connect_activate(move |application| {
@@ -36,6 +37,7 @@ pub fn run(spec: OverlaySpec, config: AppConfig) -> Result<(), String> {
             application.clone(),
             spec.clone(),
             config.clone(),
+            instance,
         )));
         manager.borrow_mut().reconcile();
 
@@ -57,7 +59,7 @@ pub fn run(spec: OverlaySpec, config: AppConfig) -> Result<(), String> {
             }
         });
     });
-    application.run_with_args(&["breakd-overlay"]);
+    application.run_with_args(&[instance.name()]);
     Ok(())
 }
 
@@ -82,6 +84,7 @@ enum ResumePhase {
 
 struct OverlayManager {
     application: gtk::Application,
+    instance: breakd_config::RuntimeInstance,
     spec: OverlaySpec,
     config: AppConfig,
     deadline: Instant,
@@ -91,7 +94,12 @@ struct OverlayManager {
 }
 
 impl OverlayManager {
-    fn new(application: gtk::Application, spec: OverlaySpec, config: AppConfig) -> Self {
+    fn new(
+        application: gtk::Application,
+        spec: OverlaySpec,
+        config: AppConfig,
+        instance: breakd_config::RuntimeInstance,
+    ) -> Self {
         let now = Instant::now();
         let resume_phase = if spec.manual_resume && spec.duration.as_duration().is_zero() {
             ResumePhase::Waiting
@@ -100,6 +108,7 @@ impl OverlayManager {
         };
         Self {
             application,
+            instance,
             deadline: now + spec.duration.as_duration(),
             strict_deadline: now + spec.strict_remaining.as_duration(),
             spec,
@@ -174,7 +183,7 @@ impl OverlayManager {
         window.set_default_size(0, 0);
         window.add_css_class("breakd-overlay");
         window.init_layer_shell();
-        window.set_namespace(Some("breakd-overlay"));
+        window.set_namespace(Some(self.instance.overlay_namespace()));
         window.set_monitor(Some(monitor));
         window.set_layer(match self.config.display.layer {
             Layer::Overlay => ShellLayer::Overlay,

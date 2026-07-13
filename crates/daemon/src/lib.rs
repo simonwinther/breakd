@@ -16,9 +16,8 @@ use tokio::{
     time::{Duration, Instant, interval},
 };
 
-const BREAK_SUBMAP: &str = "breakd";
-
 pub async fn run() -> Result<()> {
+    let instance = breakd_config::RuntimeInstance::current();
     let mut config = breakd_config::load().context("load configuration")?;
     let socket_path = breakd_config::socket_path();
     let state_store = StateStore::new(breakd_config::state_path());
@@ -78,12 +77,12 @@ pub async fn run() -> Result<()> {
     };
     tracing::info!(?idle_capability, "idle capability detected");
 
-    let notifications = NotificationClient;
+    let notifications = NotificationClient::new(instance.name());
     let mut overlay = OverlaySupervisor::default();
     apply_effects(scheduler.startup_effects(now), &mut overlay, &notifications).await;
 
     let (tray_sender, mut tray_receiver) = mpsc::unbounded_channel();
-    let mut tray = TrayController::new(tray_sender);
+    let mut tray = TrayController::new(tray_sender, instance.name());
     let mut tray_enabled = config.tray.enabled;
     if let Err(error) = tray
         .set_enabled(tray_enabled, tray_state(scheduler.status(now)))
@@ -92,7 +91,7 @@ pub async fn run() -> Result<()> {
         tracing::warn!(%error, "tray integration unavailable");
     }
 
-    let mut shortcut_guard = HyprlandShortcutGuard::new();
+    let mut shortcut_guard = HyprlandShortcutGuard::new(instance.hyprland_submap());
     shortcut_guard.initialize(&config).await;
     shortcut_guard
         .reconcile(&config, &scheduler.status(now))
@@ -313,13 +312,15 @@ async fn execute_command(
             Ok(("outputs".into(), Some(serde_json::to_value(outputs)?)))
         }
         Command::Doctor => {
+            let instance = breakd_config::RuntimeInstance::current();
+            let break_submap = instance.hyprland_submap();
             let hyprland = HyprlandClient::from_env().ok();
             let hyprland_current_submap = match &hyprland {
                 Some(client) => client.current_submap().await.ok(),
                 None => None,
             };
             let breakd_submap_registered = match &hyprland {
-                Some(client) => client.submap_exists(BREAK_SUBMAP).await.ok(),
+                Some(client) => client.submap_exists(break_submap).await.ok(),
                 None => None,
             };
             let notification_capabilities = notifications.capabilities().await.unwrap_or_default();
@@ -333,6 +334,7 @@ async fn execute_command(
                     .map(|global| global.version)
             };
             let report = serde_json::json!({
+                "instance": instance.name(),
                 "config_path": breakd_config::config_path(),
                 "state_path": state_store.path(),
                 "socket_path": breakd_config::socket_path(),
@@ -404,15 +406,17 @@ fn tray_state(status: SchedulerStatus) -> TrayState {
 
 struct HyprlandShortcutGuard {
     client: Option<HyprlandClient>,
+    submap: &'static str,
     blocking: bool,
     previous_submap: Option<String>,
     last_check: Option<Instant>,
 }
 
 impl HyprlandShortcutGuard {
-    fn new() -> Self {
+    fn new(submap: &'static str) -> Self {
         Self {
             client: HyprlandClient::from_env().ok(),
+            submap,
             blocking: false,
             previous_submap: None,
             last_check: None,
@@ -427,12 +431,12 @@ impl HyprlandShortcutGuard {
             tracing::warn!("Hyprland submap fallback unavailable: IPC is not configured");
             return;
         };
-        match client.reset_submap_if_active(BREAK_SUBMAP).await {
+        match client.reset_submap_if_active(self.submap).await {
             Ok(true) => tracing::warn!("reset stale breakd Hyprland submap"),
             Ok(false) => {}
             Err(error) => tracing::warn!(%error, "failed to inspect stale Hyprland submap"),
         }
-        if let Err(error) = client.ensure_submap(BREAK_SUBMAP).await {
+        if let Err(error) = client.ensure_submap(self.submap).await {
             tracing::warn!(%error, "failed to register breakd Hyprland submap");
         }
     }
@@ -458,7 +462,7 @@ impl HyprlandShortcutGuard {
         let Some(client) = &self.client else {
             return;
         };
-        if let Err(error) = client.ensure_submap(BREAK_SUBMAP).await {
+        if let Err(error) = client.ensure_submap(self.submap).await {
             tracing::warn!(%error, "failed to register breakd Hyprland submap");
             return;
         }
@@ -469,14 +473,14 @@ impl HyprlandShortcutGuard {
                 return;
             }
         };
-        if current == BREAK_SUBMAP {
+        if current == self.submap {
             self.blocking = true;
             return;
         }
         if !self.blocking {
             self.previous_submap = Some(current);
         }
-        match client.set_submap(BREAK_SUBMAP).await {
+        match client.set_submap(self.submap).await {
             Ok(()) => {
                 self.blocking = true;
                 tracing::info!("entered breakd Hyprland submap");
@@ -492,7 +496,7 @@ impl HyprlandShortcutGuard {
             return;
         };
         let current = client.current_submap().await.ok();
-        if current.as_deref() == Some(BREAK_SUBMAP) {
+        if current.as_deref() == Some(self.submap) {
             let target = self
                 .previous_submap
                 .take()

@@ -24,16 +24,30 @@ trait Notifications {
     fn get_capabilities(&self) -> zbus::Result<Vec<String>>;
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct NotificationClient;
+#[derive(Debug, Clone)]
+pub struct NotificationClient {
+    app_name: String,
+}
+
+impl Default for NotificationClient {
+    fn default() -> Self {
+        Self::new("breakd")
+    }
+}
 
 impl NotificationClient {
+    pub fn new(app_name: impl Into<String>) -> Self {
+        Self {
+            app_name: app_name.into(),
+        }
+    }
+
     pub async fn notify(&self, summary: &str, body: &str) -> zbus::Result<u32> {
         let connection = Connection::session().await?;
         let proxy = NotificationsProxy::new(&connection).await?;
         proxy
             .notify(
-                "breakd",
+                &self.app_name,
                 0,
                 "appointment-soon",
                 summary,

@@ -37,14 +37,16 @@ impl TrayState {
 pub struct TrayController {
     handle: Option<ksni::Handle<BreakdTray>>,
     sender: UnboundedSender<TrayAction>,
+    name: String,
     last_state: Option<TrayState>,
 }
 
 impl TrayController {
-    pub fn new(sender: UnboundedSender<TrayAction>) -> Self {
+    pub fn new(sender: UnboundedSender<TrayAction>, name: impl Into<String>) -> Self {
         Self {
             handle: None,
             sender,
+            name: name.into(),
             last_state: None,
         }
     }
@@ -66,6 +68,7 @@ impl TrayController {
             let tray = BreakdTray {
                 state: state.clone(),
                 sender: self.sender.clone(),
+                name: self.name.clone(),
             };
             self.handle = Some(tray.assume_sni_available(true).spawn().await?);
             self.last_state = Some(state);
@@ -103,6 +106,7 @@ impl TrayController {
 struct BreakdTray {
     state: TrayState,
     sender: UnboundedSender<TrayAction>,
+    name: String,
 }
 
 impl BreakdTray {
@@ -124,11 +128,11 @@ impl ksni::Tray for BreakdTray {
     const MENU_ON_ACTIVATE: bool = true;
 
     fn id(&self) -> String {
-        "breakd".into()
+        self.name.clone()
     }
 
     fn title(&self) -> String {
-        self.state.status_text()
+        format!("{}: {}", self.name, self.state.status_text())
     }
 
     fn icon_name(&self) -> String {
@@ -153,7 +157,7 @@ impl ksni::Tray for BreakdTray {
     fn tool_tip(&self) -> ToolTip {
         ToolTip {
             icon_name: self.icon_name(),
-            title: "breakd".into(),
+            title: self.name.clone(),
             description: self.state.status_text(),
             ..Default::default()
         }
@@ -164,7 +168,7 @@ impl ksni::Tray for BreakdTray {
         let settings_sender = self.sender.clone();
         vec![
             StandardItem {
-                label: self.state.status_text(),
+                label: format!("{}: {}", self.name, self.state.status_text()),
                 enabled: false,
                 ..Default::default()
             }
@@ -254,6 +258,7 @@ mod tests {
                 can_postpone: false,
             },
             sender,
+            name: "breakd-dev".into(),
         };
         let menu = ksni::Tray::menu(&tray);
         let ksni::MenuItem::Standard(item) = menu.into_iter().nth(2).unwrap() else {
@@ -278,6 +283,7 @@ mod tests {
                 can_postpone: false,
             },
             sender,
+            name: "breakd-dev".into(),
         };
         let menu = ksni::Tray::menu(&tray);
         let ksni::MenuItem::Standard(item) = menu.into_iter().last().unwrap() else {

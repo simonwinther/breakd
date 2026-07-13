@@ -4,12 +4,11 @@ use breakd_core::{AppConfig, ContentSelector, DisplayMode, DurationMs, PointerMo
 use gtk::{gio, prelude::*};
 use gtk4 as gtk;
 
-const APPLICATION_ID: &str = "io.github.simonwinther.breakd.settings";
-
 pub fn run() -> Result<(), String> {
+    let instance = breakd_config::RuntimeInstance::current();
     let initial = breakd_config::load().map_err(|error| error.to_string())?;
     let application = gtk::Application::builder()
-        .application_id(APPLICATION_ID)
+        .application_id(instance.settings_application_id())
         .build();
     let window_holder = Rc::new(RefCell::new(None::<gtk::ApplicationWindow>));
     let holder_for_activate = window_holder.clone();
@@ -19,7 +18,7 @@ pub fn run() -> Result<(), String> {
             return;
         }
         install_css();
-        let window = build_window(application, initial.clone());
+        let window = build_window(application, initial.clone(), instance);
         let holder_for_close = holder_for_activate.clone();
         window.connect_close_request(move |_| {
             holder_for_close.borrow_mut().take();
@@ -32,7 +31,7 @@ pub fn run() -> Result<(), String> {
     application.connect_shutdown(move |_| {
         holder_for_shutdown.borrow_mut().take();
     });
-    application.run_with_args(&["breakd-settings"]);
+    application.run_with_args(&[instance.name()]);
     Ok(())
 }
 
@@ -124,7 +123,11 @@ impl SettingsWidgets {
     }
 }
 
-fn build_window(application: &gtk::Application, initial: AppConfig) -> gtk::ApplicationWindow {
+fn build_window(
+    application: &gtk::Application,
+    initial: AppConfig,
+    instance: breakd_config::RuntimeInstance,
+) -> gtk::ApplicationWindow {
     let state = Rc::new(RefCell::new(initial.clone()));
     let (schedule_page, schedule_widgets) = schedule_page(&initial);
     let (actions_page, action_widgets) = actions_page(&initial);
@@ -211,12 +214,13 @@ fn build_window(application: &gtk::Application, initial: AppConfig) -> gtk::Appl
     save.add_css_class("suggested-action");
     save.set_tooltip_text(Some("Validate, save, and reload the configuration"));
     let header = gtk::HeaderBar::new();
-    header.set_title_widget(Some(&gtk::Label::new(Some("breakd Settings"))));
+    let window_title = format!("{} Settings", instance.name());
+    header.set_title_widget(Some(&gtk::Label::new(Some(&window_title))));
     header.pack_end(&save);
 
     let window = gtk::ApplicationWindow::builder()
         .application(application)
-        .title("breakd Settings")
+        .title(&window_title)
         .default_width(760)
         .default_height(720)
         .child(&root)

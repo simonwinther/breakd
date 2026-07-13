@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+breakd-config = { path = "../config" }
 breakd-core = { path = "../core" }
 breakd-platform-linux = { path = "../platform-linux" }
 glib.workspace = true
@@ -13,6 +14,3 @@ gtk4.workspace = true
 gtk4-layer-shell.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-breakd-config = { path = "../config" }

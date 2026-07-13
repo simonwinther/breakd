@@ -18,6 +18,58 @@ use thiserror::Error;
 mod messages;
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const INSTANCE_ENV: &str = "BREAKD_INSTANCE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeInstance {
+    Production,
+    Development,
+}
+
+impl RuntimeInstance {
+    pub fn current() -> Self {
+        Self::from_name(env::var(INSTANCE_ENV).ok().as_deref())
+    }
+
+    fn from_name(name: Option<&str>) -> Self {
+        match name {
+            Some("dev") => Self::Development,
+            _ => Self::Production,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Production => "breakd",
+            Self::Development => "breakd-dev",
+        }
+    }
+
+    pub const fn settings_application_id(self) -> &'static str {
+        match self {
+            Self::Production => "io.github.simonwinther.breakd.settings",
+            Self::Development => "io.github.simonwinther.breakd.settings.dev",
+        }
+    }
+
+    pub const fn overlay_application_id(self) -> &'static str {
+        match self {
+            Self::Production => "io.github.breakd.Overlay",
+            Self::Development => "io.github.breakd.Overlay.Dev",
+        }
+    }
+
+    pub const fn overlay_namespace(self) -> &'static str {
+        match self {
+            Self::Production => "breakd-overlay",
+            Self::Development => "breakd-dev-overlay",
+        }
+    }
+
+    pub const fn hyprland_submap(self) -> &'static str {
+        self.name()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -143,21 +195,23 @@ pub fn config_path() -> PathBuf {
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".config"))
-        .join("breakd/config.toml")
+        .join(RuntimeInstance::current().name())
+        .join("config.toml")
 }
 
 pub fn state_path() -> PathBuf {
     env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".local/state"))
-        .join("breakd/state.json")
+        .join(RuntimeInstance::current().name())
+        .join("state.json")
 }
 
 pub fn runtime_dir() -> PathBuf {
     env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", Uid::effective())))
-        .join("breakd")
+        .join(RuntimeInstance::current().name())
 }
 
 pub fn socket_path() -> PathBuf {
@@ -358,6 +412,43 @@ mod tests {
         let encoded = example_toml();
         let decoded: AppConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, defaults());
+    }
+
+    #[test]
+    fn development_identity_is_separate_from_production() {
+        let production = RuntimeInstance::Production;
+        let development = RuntimeInstance::Development;
+
+        assert_ne!(development.name(), production.name());
+        assert_ne!(
+            development.settings_application_id(),
+            production.settings_application_id()
+        );
+        assert_ne!(
+            development.overlay_application_id(),
+            production.overlay_application_id()
+        );
+        assert_ne!(
+            development.overlay_namespace(),
+            production.overlay_namespace()
+        );
+        assert_ne!(development.hyprland_submap(), production.hyprland_submap());
+    }
+
+    #[test]
+    fn dev_instance_is_selected_explicitly() {
+        assert_eq!(
+            RuntimeInstance::from_name(Some("dev")),
+            RuntimeInstance::Development
+        );
+        assert_eq!(
+            RuntimeInstance::from_name(None),
+            RuntimeInstance::Production
+        );
+        assert_eq!(
+            RuntimeInstance::from_name(Some("unknown")),
+            RuntimeInstance::Production
+        );
     }
 
     #[test]

@@ -219,6 +219,30 @@ systemctl --user import-environment \
 systemctl --user restart breakd.service
 ```
 
+## Development instance
+
+Use the development launcher to run the working tree alongside an installed
+`breakd` service:
+
+```bash
+# Terminal 1: build and start the isolated development daemon
+./scripts/breakd-dev
+
+# Terminal 2: control that daemon
+./scripts/breakd-dev settings
+./scripts/breakd-dev mini
+./scripts/breakd-dev status --json
+```
+
+The launcher builds the debug binary and selects the `breakd-dev` instance. It
+uses separate configuration, state, IPC, GTK, tray, overlay, notification, and
+Hyprland identities, so the installed service does not need to be stopped or
+restarted. Development settings are stored in
+`~/.config/breakd-dev/config.toml`.
+
+Production and development break overlays can still appear at the same time if
+both schedules become due.
+
 ## Build from source
 
 Install the build dependencies:
