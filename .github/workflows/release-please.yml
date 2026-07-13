@@ -1,0 +1,82 @@
+name: release-please
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - uses: actions/checkout@v4
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.release.outputs.tag_name }}
+
+      - name: Build source archive
+        id: source
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          archive="$(scripts/build-source-archive.sh "$RELEASE_TAG")"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Build Arch package
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          SOURCE_ARCHIVE: ${{ steps.source.outputs.archive }}
+        run: |
+          host_uid="$(id -u)"
+          host_gid="$(id -g)"
+          docker run --rm \
+            -e HOST_UID="$host_uid" \
+            -e HOST_GID="$host_gid" \
+            -e RELEASE_TAG \
+            -e SOURCE_ARCHIVE \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            archlinux:base-devel bash -lc '
+              set -euo pipefail
+              pacman -Syu --noconfirm --needed \
+                cairo git glib2 graphene gtk4 gtk4-layer-shell namcap pkgconf rust wayland
+              getent group "$HOST_GID" >/dev/null || groupadd -g "$HOST_GID" builder
+              useradd -m -u "$HOST_UID" -g "$HOST_GID" builder
+              chown -R "$HOST_UID:$HOST_GID" /workspace
+              runuser -u builder -- scripts/build-arch-package.sh \
+                "$RELEASE_TAG" "$SOURCE_ARCHIVE"
+              namcap dist/arch/PKGBUILD dist/arch/*.pkg.tar.zst
+            '
+
+      - name: Upload release artifacts
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          SOURCE_ARCHIVE: ${{ steps.source.outputs.archive }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "$SOURCE_ARCHIVE" \
+            dist/arch/breakd-*.pkg.tar.zst \
+            dist/arch/PKGBUILD \
+            dist/arch/.SRCINFO \
+            --clobber
+
+      - name: Publish AUR package
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: scripts/publish-aur.sh "${{ steps.release.outputs.tag_name }}"

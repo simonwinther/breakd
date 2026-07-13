@@ -1,0 +1,15 @@
+[Unit]
+Description=Wayland-native break reminder
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/breakd daemon
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+Environment=GDK_BACKEND=wayland
+
+[Install]
+WantedBy=graphical-session.target

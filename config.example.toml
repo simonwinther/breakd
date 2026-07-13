@@ -1,0 +1,76 @@
+schema_version = 1
+
+[schedule.mini]
+interval = "10m"
+duration = "20s"
+
+[schedule.long]
+interval = "30m"
+duration = "5m"
+after_minis = 2
+
+[notifications]
+enabled = true
+mini_lead = "10s"
+long_lead = "30s"
+actions = true
+
+[postpone.mini]
+duration = "2m"
+max_count = 1
+
+[postpone.long]
+duration = "5m"
+max_count = 1
+
+[strict]
+mode = "delay" # off | delay | entire
+minimum_visible = "10s"
+allow_postpone_during_lockout = false
+
+[display]
+mode = "dim-all-content-one" # all | focused | cursor | primary | configured | dim-all-content-one
+content_selector = "focused" # focused | cursor | primary | configured
+# preferred_monitor = "edid:Dell Inc.:DELL U2723QE:ABC123"
+# primary_monitor = "connector:eDP-1"
+fallback = ["focused", "cursor", "primary"]
+layer = "overlay" # overlay | top
+opacity = 0.88
+dim_color = "#101418"
+pointer_mode = "block" # block | controls | none
+keyboard_mode = "on-demand" # none | on-demand | exclusive
+
+[content]
+show_message = true
+messages = [
+  "Look away from the screen and relax your eyes.",
+  "Stand up, breathe slowly, and loosen your shoulders.",
+  "Let your hands rest and change your posture.",
+]
+
+[idle]
+enabled = true
+reset_after = "5m"
+respect_idle_inhibitors = false
+
+[recovery]
+wake_grace = "3s"
+missed_break = "show-once"
+suspend_counts_as_break = true
+lock_counts_as_break = true
+recover_active_break = true
+
+[fullscreen]
+behavior = "show" # show is the dependable MVP behavior
+max_delay = "10m"
+
+[startup]
+start_paused = false
+recover_state = true
+
+[hyprland]
+enabled = true
+
+[logging]
+level = "info"
+format = "journald"

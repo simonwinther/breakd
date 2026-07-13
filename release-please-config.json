@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "plugins": [
+    {
+      "type": "cargo-workspace"
+    }
+  ],
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "package-name": "breakd",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": false,
+      "initial-version": "0.1.0",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "packaging/arch/PKGBUILD"
+        }
+      ]
+    }
+  }
+}

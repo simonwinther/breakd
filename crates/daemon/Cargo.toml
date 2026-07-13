@@ -1,0 +1,18 @@
+[package]
+name = "breakd-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+breakd-config = { path = "../config" }
+breakd-core = { path = "../core" }
+breakd-ipc = { path = "../ipc" }
+breakd-platform-linux = { path = "../platform-linux" }
+breakd-scheduler = { path = "../scheduler" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true

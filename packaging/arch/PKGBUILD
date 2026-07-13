@@ -1,0 +1,49 @@
+# Maintainer: Simon Winther <simonwinther@users.noreply.github.com>
+pkgname=breakd
+pkgver=0.1.0 # x-release-please-version
+pkgrel=1
+pkgdesc='Wayland-native break reminder with multi-monitor overlays'
+arch=('x86_64')
+url='https://github.com/simonwinther/breakd'
+license=('MIT')
+depends=('cairo' 'glib2' 'glibc' 'graphene' 'gtk4' 'gtk4-layer-shell')
+makedepends=('cargo' 'pkgconf')
+options=('!debug')
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_HOME="$srcdir/cargo-home"
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=."
+  cargo build --frozen --release --workspace
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=."
+  cargo test --frozen --workspace
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "$srcdir/target/release/breakd" "$pkgdir/usr/bin/breakd"
+  install -Dm644 packaging/systemd/breakd.service \
+    "$pkgdir/usr/lib/systemd/user/breakd.service"
+  install -Dm644 config.example.toml \
+    "$pkgdir/usr/share/doc/breakd/config.example.toml"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/breakd/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/breakd/LICENSE"
+}
