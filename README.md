@@ -1,63 +1,87 @@
 # breakd
 
-`breakd` is a Wayland-native break reminder for Arch Linux and Hyprland. A headless daemon owns scheduling and persistence. Break UI runs in a supervised GTK4 layer-shell child that creates one surface per selected Wayland output.
+Break reminders for Hyprland on Wayland.
 
-## Current scope
+## Install
 
-Implemented:
+Install the AUR package and start the user service:
 
-- Mini and long break cadence with durable state.
-- Pre-break desktop notifications.
-- Pause, timed pause, resume, reset, skip, postpone, and manual breaks.
-- Delayed or entire-break strict mode.
-- `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` recovery across clock changes and suspend.
-- logind sleep/lock signals and `ext-idle-notify-v1` natural-break detection.
-- Per-output `wlr-layer-shell` overlays with hot-plug reconciliation.
-- All, focused, cursor, configured, application-primary, and dim-all/content-one display modes.
-- Connector/EDID monitor identities from direct Hyprland IPC.
-- Unix-socket CLI with same-UID authentication.
-- D-Bus notifications, systemd user service, and diagnostics.
+```bash
+yay -S breakd
+systemctl --user enable --now breakd.service
+breakd status
+```
 
-Not yet implemented:
+`breakd` runs as your user. It does not need root access or access to `/dev/input`.
 
-- StatusNotifierItem tray.
-- Portal global shortcuts. Hyprland CLI bindings are recommended.
-- Automatic full-screen postponement. The dependable behavior is to show on the overlay layer.
-- A graphical preferences editor.
+## Configure
 
-## Requirements
+`breakd` works without a configuration file. To change the defaults:
 
-Arch packages:
+```bash
+mkdir -p ~/.config/breakd
+breakd example-config > ~/.config/breakd/config.toml
+$EDITOR ~/.config/breakd/config.toml
+breakd reload
+```
+
+The default schedule is a 20-second mini break every 10 minutes and a 5-minute long break every 30 minutes. Durations accept values such as `20s`, `10m`, and `1h`.
+
+Most changes take effect after `breakd reload`. Restart the service after changing `[idle]` or `[logging]`:
+
+```bash
+systemctl --user restart breakd.service
+```
+
+### Strict mode
+
+Set `strict.mode` to one of these values:
+
+- `off`: skip and postpone are available immediately.
+- `delay`: controls unlock after `strict.minimum_visible`.
+- `entire`: the break cannot be skipped.
+
+### Pointer and keyboard input
+
+`display.pointer_mode` controls where clicks go during a break:
+
+- `block`: captures clicks across the full overlay. Controls remain clickable. This is the default.
+- `controls`: captures clicks on the content panel and passes background clicks through.
+- `none`: makes the full overlay click-through.
+
+`display.keyboard_mode` accepts `none`, `on-demand`, or `exclusive`. The default is `on-demand`.
+
+## Monitors
+
+Run `breakd outputs` to list connected monitors and their stable identifiers:
 
 ```text
-gtk4
-gtk4-layer-shell
-wayland
-wayland-protocols
-rust
-pkgconf
+edid:<make>:<model>:<serial>
+connector:<name>
 ```
 
-The program runs as the current user. It does not read `/dev/input`, require the `input` group, or use root privileges.
+Use one of these values for `display.mode`:
 
-## Build
+- `all`: show the full break on every monitor.
+- `focused`: show it on the focused monitor.
+- `cursor`: show it on the monitor containing the cursor.
+- `primary`: use `display.primary_monitor`.
+- `configured`: use `display.preferred_monitor`.
+- `dim-all-content-one`: dim every monitor and put the message and controls on the monitor selected by `display.content_selector`.
 
-```bash
-cargo build --release --workspace
-cargo test --workspace
+For example:
+
+```toml
+[display]
+mode = "configured"
+preferred_monitor = "connector:DP-1"
+fallback = ["focused", "cursor", "primary"]
+pointer_mode = "block"
+keyboard_mode = "on-demand"
+opacity = 0.88
 ```
 
-Install for the current user:
-
-```bash
-install -Dm755 target/release/breakd ~/.local/bin/breakd
-install -Dm644 packaging/systemd/breakd-local.service ~/.config/systemd/user/breakd.service
-install -Dm600 config.example.toml ~/.config/breakd/config.toml
-systemctl --user daemon-reload
-systemctl --user enable --now breakd.service
-```
-
-The service requires `WAYLAND_DISPLAY`, `HYPRLAND_INSTANCE_SIGNATURE`, and the D-Bus address in the systemd user-manager environment. `breakd doctor` reports missing values. Most Hyprland/Omarchy sessions already import them.
+If a configured monitor is unavailable, `breakd` follows the entries in `display.fallback`.
 
 ## Commands
 
@@ -77,28 +101,11 @@ breakd doctor [--json]
 breakd example-config
 ```
 
-The control socket is `$XDG_RUNTIME_DIR/breakd/control.sock`, mode `0600`. `status`, `outputs`, and `doctor` support machine-readable JSON.
+`skip` and `postpone` follow the active strict-mode and postpone settings.
 
-## Configuration
+## Hyprland bindings
 
-Copy `config.example.toml` to `$XDG_CONFIG_HOME/breakd/config.toml`. If the file is absent, built-in defaults are used. `breakd reload` validates the complete file before replacing active settings.
-
-Scheduler, notification, display, and content changes apply to subsequent events and overlays. Restart the daemon after changing idle-monitor or logging settings because those integrations own long-lived subscriptions.
-
-Monitor selectors shown by `breakd outputs` use:
-
-```text
-edid:<make>:<model>:<serial>
-connector:<name>
-```
-
-EDID identity is preferred. Connector identity is the fallback for displays without a usable serial. Display-array indices are never persisted.
-
-`display.pointer_mode = "block"` is the default and prevents pointer input from reaching applications behind any overlay surface. `controls` only captures the content panel, while `none` makes the complete overlay click-through.
-
-## Hyprland integration
-
-Hyprland 0.55+ Lua bindings:
+Any Hyprland binding can call the CLI. For Hyprland 0.55+ Lua configuration:
 
 ```lua
 hl.bind("SUPER + SHIFT + B", hl.dsp.exec_cmd("breakd toggle"))
@@ -106,10 +113,9 @@ hl.bind("SUPER + SHIFT + S", hl.dsp.exec_cmd("breakd skip"))
 hl.bind("SUPER + SHIFT + P", hl.dsp.exec_cmd("breakd postpone"))
 hl.bind("SUPER + SHIFT + M", hl.dsp.exec_cmd("breakd mini"))
 hl.bind("SUPER + SHIFT + L", hl.dsp.exec_cmd("breakd long"))
-hl.bind("SUPER + SHIFT + R", hl.dsp.exec_cmd("breakd reset"))
 ```
 
-Optional layer rule:
+An optional layer rule disables overlay animations:
 
 ```lua
 hl.layer_rule({
@@ -118,32 +124,48 @@ hl.layer_rule({
 })
 ```
 
-Check existing bindings before adding these. Reload and validate with:
+Reload Hyprland after editing its configuration:
 
 ```bash
 hyprctl reload
 hyprctl configerrors
 ```
 
-## State and recovery
+## Troubleshooting
 
-State is stored at `$XDG_STATE_HOME/breakd/state.json` using a temporary file, `fsync`, and atomic rename. Same-boot recovery uses persisted monotonic/boottime deadlines. A changed kernel boot ID starts a fresh work interval.
-
-The daemon remains authoritative if overlay creation fails. Overlay children are killed when a break ends, and dropping their single Wayland connection removes all associated output surfaces.
-
-Logs are written to stdout/stderr and captured by the user journal:
+Check the daemon, desktop integrations, and monitor detection:
 
 ```bash
+breakd doctor
+breakd outputs
+systemctl --user status breakd.service
 journalctl --user -u breakd.service -f
 ```
 
-## Development checks
+If the service cannot see the Wayland or Hyprland environment, import the session variables and restart it:
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-cargo build --release --workspace
+systemctl --user import-environment \
+  WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE DBUS_SESSION_BUS_ADDRESS
+systemctl --user restart breakd.service
 ```
 
-Real multi-monitor behavior must still be checked under Hyprland. Nested wlroots compositors are useful for lifecycle tests but do not replace target-session validation.
+## Build from source
+
+Install the build dependencies:
+
+```bash
+sudo pacman -S --needed base-devel gtk4 gtk4-layer-shell rust
+cargo build --locked --release
+```
+
+Install the binary and user service:
+
+```bash
+install -Dm755 target/release/breakd ~/.local/bin/breakd
+install -Dm644 packaging/systemd/breakd-local.service \
+  ~/.config/systemd/user/breakd.service
+install -Dm600 config.example.toml ~/.config/breakd/config.toml
+systemctl --user daemon-reload
+systemctl --user enable --now breakd.service
+```
