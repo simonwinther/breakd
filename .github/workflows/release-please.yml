@@ -19,6 +19,16 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      - name: Check out release pull request
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr || '{}').headBranchName }}
+
+      - name: Sync Cargo.lock with bumped crate versions
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        run: scripts/sync-cargo-lock.sh
+
       - uses: actions/checkout@v6
         if: ${{ steps.release.outputs.release_created == 'true' }}
         with:
