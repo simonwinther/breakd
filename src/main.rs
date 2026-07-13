@@ -49,6 +49,8 @@ enum CliCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Open the graphical configuration window.
+    Settings,
     #[command(hide = true)]
     Overlay,
     /// Print the default TOML configuration.
@@ -93,6 +95,7 @@ async fn execute(arguments: Arguments) -> Result<()> {
         CliCommand::Reload => send(Command::Reload, false).await,
         CliCommand::Outputs { json } => send(Command::Outputs, json).await,
         CliCommand::Doctor { json } => send(Command::Doctor, json).await,
+        CliCommand::Settings => breakd_settings::run().map_err(anyhow::Error::msg),
     }
 }
 

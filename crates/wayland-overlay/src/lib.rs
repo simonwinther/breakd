@@ -8,7 +8,7 @@ use std::{
 
 use breakd_core::{
     AppConfig, ContentSelector, DisplayMode, KeyboardMode, Layer, OutputInfo, OverlaySpec,
-    PointerMode,
+    PointerMode, StrictMode,
 };
 use breakd_platform_linux::HyprlandClient;
 use gtk::{gdk, gio, prelude::*};
@@ -168,7 +168,13 @@ impl OverlayManager {
         for edge in [Edge::Top, Edge::Right, Edge::Bottom, Edge::Left] {
             window.set_anchor(edge, true);
         }
-        window.set_keyboard_mode(if content && input_owner {
+        let inhibit_shortcuts = content
+            && input_owner
+            && self.config.strict.mode != StrictMode::Off
+            && self.config.strict.inhibit_shortcuts;
+        window.set_keyboard_mode(if inhibit_shortcuts {
+            LayerKeyboardMode::Exclusive
+        } else if content && input_owner {
             match self.config.display.keyboard_mode {
                 KeyboardMode::None => LayerKeyboardMode::None,
                 KeyboardMode::OnDemand => LayerKeyboardMode::OnDemand,
@@ -180,13 +186,26 @@ impl OverlayManager {
 
         let (panel, countdown, skip, postpone) = if content {
             let widgets = build_content(&window, &self.spec);
-            (Some(widgets.0), Some(widgets.1), Some(widgets.2), widgets.3)
+            (Some(widgets.0), Some(widgets.1), widgets.2, widgets.3)
         } else {
             (None, None, None, None)
         };
 
+        let strict_complete = self.spec.strict_remaining.as_duration().is_zero();
+        if let Some(button) = &skip {
+            button.set_sensitive(strict_complete);
+        }
+        if let Some(button) = &postpone {
+            button
+                .set_sensitive(strict_complete || self.config.strict.allow_postpone_during_lockout);
+        }
+        if content && input_owner {
+            configure_action_keys(&window, skip.as_ref(), postpone.as_ref());
+        }
+
         configure_input_region(&window, panel.as_ref(), self.config.display.pointer_mode);
         window.present();
+        configure_shortcut_inhibition(&window, inhibit_shortcuts);
         SurfaceWidgets {
             monitor: monitor.clone(),
             content,
@@ -223,7 +242,12 @@ impl OverlayManager {
 fn build_content(
     window: &gtk::ApplicationWindow,
     spec: &OverlaySpec,
-) -> (gtk::Box, gtk::Label, gtk::Button, Option<gtk::Button>) {
+) -> (
+    gtk::Box,
+    gtk::Label,
+    Option<gtk::Button>,
+    Option<gtk::Button>,
+) {
     let panel = gtk::Box::new(gtk::Orientation::Vertical, 18);
     panel.set_halign(gtk::Align::Center);
     panel.set_valign(gtk::Align::Center);
@@ -252,10 +276,13 @@ fn build_content(
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     actions.set_halign(gtk::Align::Center);
     actions.set_homogeneous(true);
-    let skip = gtk::Button::with_label("Skip");
-    skip.add_css_class("breakd-action");
-    skip.connect_clicked(|_| invoke_cli("skip"));
-    actions.append(&skip);
+    let skip = spec.can_skip.then(|| {
+        let button = gtk::Button::with_label("Skip");
+        button.add_css_class("breakd-action");
+        button.connect_clicked(|_| invoke_cli("skip"));
+        actions.append(&button);
+        button
+    });
 
     let postpone = spec.can_postpone.then(|| {
         let button = gtk::Button::with_label("Postpone");
@@ -264,9 +291,70 @@ fn build_content(
         actions.append(&button);
         button
     });
-    panel.append(&actions);
+    if skip.is_some() || postpone.is_some() {
+        panel.append(&actions);
+    }
     window.set_child(Some(&panel));
     (panel, countdown, skip, postpone)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayAction {
+    Skip,
+    Postpone,
+}
+
+fn action_for_key(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<OverlayAction> {
+    let command_modifiers = gdk::ModifierType::SHIFT_MASK
+        | gdk::ModifierType::CONTROL_MASK
+        | gdk::ModifierType::ALT_MASK
+        | gdk::ModifierType::SUPER_MASK;
+    if modifiers.intersects(command_modifiers) {
+        return None;
+    }
+
+    match key
+        .to_unicode()
+        .map(|character| character.to_ascii_lowercase())
+    {
+        Some('s') => Some(OverlayAction::Skip),
+        Some('p') => Some(OverlayAction::Postpone),
+        _ => None,
+    }
+}
+
+fn configure_action_keys(
+    window: &gtk::ApplicationWindow,
+    skip: Option<&gtk::Button>,
+    postpone: Option<&gtk::Button>,
+) {
+    let skip = skip.map(|button| button.downgrade());
+    let postpone = postpone.map(|button| button.downgrade());
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.connect_key_pressed(move |_, key, _, modifiers| {
+        let Some(action) = action_for_key(key, modifiers) else {
+            return glib::Propagation::Proceed;
+        };
+        let enabled = match action {
+            OverlayAction::Skip => skip
+                .as_ref()
+                .and_then(glib::WeakRef::upgrade)
+                .is_some_and(|button| button.is_sensitive()),
+            OverlayAction::Postpone => postpone
+                .as_ref()
+                .and_then(glib::WeakRef::upgrade)
+                .is_some_and(|button| button.is_sensitive()),
+        };
+        if enabled {
+            invoke_cli(match action {
+                OverlayAction::Skip => "skip",
+                OverlayAction::Postpone => "postpone",
+            });
+        }
+        glib::Propagation::Stop
+    });
+    window.add_controller(controller);
 }
 
 fn configure_input_region(
@@ -302,6 +390,30 @@ fn configure_input_region(
             surface.set_input_region(Some(&region));
         }
     });
+}
+
+fn configure_shortcut_inhibition(window: &gtk::ApplicationWindow, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    if window.is_realized() {
+        request_shortcut_inhibition(window);
+    } else {
+        window.connect_realize(request_shortcut_inhibition);
+    }
+}
+
+fn request_shortcut_inhibition(window: &gtk::ApplicationWindow) {
+    let Some(surface) = window.surface() else {
+        tracing::warn!("cannot inhibit shortcuts without a GDK surface");
+        return;
+    };
+    let Ok(toplevel) = surface.dynamic_cast::<gdk::Toplevel>() else {
+        tracing::warn!("GDK layer surface does not support shortcut inhibition");
+        return;
+    };
+    toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
+    tracing::info!("requested compositor shortcut inhibition");
 }
 
 fn set_panel_input_region(window: &gtk::ApplicationWindow, panel: &gtk::Box) {
@@ -542,6 +654,26 @@ mod tests {
     fn parses_rgb_color() {
         assert_eq!(parse_hex_color("#101418"), Some((16, 20, 24)));
         assert_eq!(parse_hex_color("invalid"), None);
+    }
+
+    #[test]
+    fn plain_action_keys_are_recognized() {
+        assert_eq!(
+            action_for_key(gdk::Key::s, gdk::ModifierType::empty()),
+            Some(OverlayAction::Skip)
+        );
+        assert_eq!(
+            action_for_key(gdk::Key::P, gdk::ModifierType::LOCK_MASK),
+            Some(OverlayAction::Postpone)
+        );
+        assert_eq!(
+            action_for_key(gdk::Key::s, gdk::ModifierType::CONTROL_MASK),
+            None
+        );
+        assert_eq!(
+            action_for_key(gdk::Key::Escape, gdk::ModifierType::empty()),
+            None
+        );
     }
 
     #[test]

@@ -127,6 +127,8 @@ pub struct SchedulerStatus {
     pub minis_since_long: u32,
     pub active_session: Option<BreakSessionId>,
     pub postpone_count: u32,
+    pub can_skip: bool,
+    pub can_postpone: bool,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -137,8 +139,12 @@ pub enum SchedulerError {
     BreakAlreadyActive,
     #[error("strict mode does not allow dismissal yet")]
     StrictMode,
+    #[error("skipping is disabled for this break")]
+    SkipDisabled,
     #[error("the postpone limit has been reached")]
     PostponeLimit,
+    #[error("postponement is disabled for this break")]
+    PostponeDisabled,
     #[error("the scheduler is already paused")]
     AlreadyPaused,
     #[error("the scheduler is not paused")]
@@ -308,6 +314,10 @@ impl Scheduler {
     pub fn status(&self, now: ClockSample) -> SchedulerStatus {
         let context = self.context();
         let active = self.active_break();
+        let paused = matches!(
+            self.state,
+            SchedulerState::PausedIndefinitely { .. } | SchedulerState::PausedUntil { .. }
+        );
         let remaining_ms = if let Some(active) = active {
             Some(active.ends_boot_ms.saturating_sub(now.boottime_ms))
         } else {
@@ -315,10 +325,7 @@ impl Scheduler {
         };
         SchedulerStatus {
             state: state_name(&self.state).into(),
-            paused: matches!(
-                self.state,
-                SchedulerState::PausedIndefinitely { .. } | SchedulerState::PausedUntil { .. }
-            ),
+            paused,
             break_kind: active.map(|active| active.due.kind).or_else(|| {
                 context.and_then(|context| context.pending.as_ref().map(|due| due.kind))
             }),
@@ -332,6 +339,13 @@ impl Scheduler {
                         .and_then(|context| context.pending.as_ref().map(|due| due.postpone_count))
                 })
                 .unwrap_or(0),
+            can_skip: !paused
+                && active.is_some_and(|active| {
+                    self.skip_available(active.due.kind)
+                        && now.boottime_ms >= active.strict_until_boot_ms
+                }),
+            can_postpone: !paused
+                && active.is_some_and(|active| self.postpone_allowed(active, now)),
         }
     }
 
@@ -526,11 +540,13 @@ impl Scheduler {
     }
 
     fn ensure_dismissal_allowed(&self, now: ClockSample) -> Result<(), SchedulerError> {
-        if self
-            .active_break()
-            .is_some_and(|active| now.boottime_ms < active.strict_until_boot_ms)
-        {
-            return Err(SchedulerError::StrictMode);
+        if let Some(active) = self.active_break() {
+            if !self.skip_available(active.due.kind) {
+                return Err(SchedulerError::SkipDisabled);
+            }
+            if now.boottime_ms < active.strict_until_boot_ms {
+                return Err(SchedulerError::StrictMode);
+            }
         }
         Ok(())
     }
@@ -540,19 +556,25 @@ impl Scheduler {
             .active_break()
             .cloned()
             .ok_or(SchedulerError::NoActiveBreak)?;
+        let rule = match active.due.kind {
+            BreakKind::Mini => &self.config.postpone.mini,
+            BreakKind::Long => &self.config.postpone.long,
+        };
+        if !rule.enabled {
+            return Err(SchedulerError::PostponeDisabled);
+        }
         if now.boottime_ms < active.strict_until_boot_ms
             && !self.config.strict.allow_postpone_during_lockout
         {
             return Err(SchedulerError::StrictMode);
         }
-        let rule = match active.due.kind {
-            BreakKind::Mini => &self.config.postpone.mini,
-            BreakKind::Long => &self.config.postpone.long,
-        };
-        if active.due.postpone_count >= rule.max_count {
+        if rule
+            .max_postponements
+            .is_some_and(|maximum| active.due.postpone_count >= maximum)
+        {
             return Err(SchedulerError::PostponeLimit);
         }
-        active.due.postpone_count += 1;
+        active.due.postpone_count = active.due.postpone_count.saturating_add(1);
         let session_id = active.session_id;
         let mut context = active.context;
         context.next_due_mono_ms = now.monotonic_ms.saturating_add(rule.duration.as_millis());
@@ -724,17 +746,35 @@ impl Scheduler {
             strict_remaining: DurationMs::from_millis(
                 active.strict_until_boot_ms.saturating_sub(now.boottime_ms),
             ),
-            can_postpone: active.due.postpone_count < self.postpone_limit(active.due.kind),
+            can_skip: self.skip_available(active.due.kind),
+            can_postpone: self.postpone_available(active),
             message,
             socket_path: self.socket_path.clone(),
         }
     }
 
-    fn postpone_limit(&self, kind: BreakKind) -> u32 {
+    fn skip_available(&self, kind: BreakKind) -> bool {
         match kind {
-            BreakKind::Mini => self.config.postpone.mini.max_count,
-            BreakKind::Long => self.config.postpone.long.max_count,
+            BreakKind::Mini => self.config.skip.mini.enabled,
+            BreakKind::Long => self.config.skip.long.enabled,
         }
+    }
+
+    fn postpone_allowed(&self, active: &ActiveBreak, now: ClockSample) -> bool {
+        self.postpone_available(active)
+            && (now.boottime_ms >= active.strict_until_boot_ms
+                || self.config.strict.allow_postpone_during_lockout)
+    }
+
+    fn postpone_available(&self, active: &ActiveBreak) -> bool {
+        let rule = match active.due.kind {
+            BreakKind::Mini => &self.config.postpone.mini,
+            BreakKind::Long => &self.config.postpone.long,
+        };
+        rule.enabled
+            && rule
+                .max_postponements
+                .is_none_or(|maximum| active.due.postpone_count < maximum)
     }
 
     fn active_break(&self) -> Option<&ActiveBreak> {
@@ -871,6 +911,8 @@ mod tests {
         config.notifications.mini_lead = DurationMs::from_millis(100);
         config.notifications.long_lead = DurationMs::from_millis(100);
         config.strict.minimum_visible = DurationMs::from_millis(20);
+        config.postpone.mini.max_postponements = Some(1);
+        config.postpone.long.max_postponements = Some(1);
         Scheduler::new(config, "boot".into(), clock(0), "/tmp/breakd.sock".into())
     }
 
@@ -895,11 +937,18 @@ mod tests {
     #[test]
     fn strict_mode_rejects_early_skip() {
         let mut scheduler = test_scheduler();
-        scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+        let effects = scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+        let Effect::StartOverlay(spec) = &effects[0] else {
+            panic!("expected an overlay");
+        };
+        assert!(spec.can_skip);
+        assert!(spec.can_postpone);
+        assert!(!scheduler.status(clock(10)).can_postpone);
         assert_eq!(
             scheduler.handle_command(&Command::Skip, clock(10)),
             Err(SchedulerError::StrictMode)
         );
+        assert!(scheduler.status(clock(20)).can_postpone);
         assert!(scheduler.handle_command(&Command::Skip, clock(20)).is_ok());
     }
 
@@ -935,6 +984,144 @@ mod tests {
         assert_eq!(
             scheduler.handle_command(&Command::Postpone, clock(due + 20)),
             Err(SchedulerError::PostponeLimit)
+        );
+    }
+
+    #[test]
+    fn two_postponements_are_allowed_before_the_control_disappears() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.postpone.mini.max_postponements = Some(2);
+        scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+
+        scheduler
+            .handle_command(&Command::Postpone, clock(20))
+            .unwrap();
+        let first_due = match scheduler.state() {
+            SchedulerState::Running { context } => context.next_due_mono_ms,
+            state => panic!("unexpected state {state:?}"),
+        };
+        let effects = scheduler.handle_event(SchedulerEvent::Tick, clock(first_due));
+        let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+            panic!("expected the first postponed overlay");
+        };
+        assert!(spec.can_postpone);
+
+        scheduler
+            .handle_command(&Command::Postpone, clock(first_due + 20))
+            .unwrap();
+        let second_due = match scheduler.state() {
+            SchedulerState::Running { context } => context.next_due_mono_ms,
+            state => panic!("unexpected state {state:?}"),
+        };
+        let effects = scheduler.handle_event(SchedulerEvent::Tick, clock(second_due));
+        let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+            panic!("expected the second postponed overlay");
+        };
+        assert!(!spec.can_postpone);
+        assert!(!scheduler.status(clock(second_due + 20)).can_postpone);
+        assert_eq!(
+            scheduler.handle_command(&Command::Postpone, clock(second_due + 20)),
+            Err(SchedulerError::PostponeLimit)
+        );
+    }
+
+    #[test]
+    fn omitted_postponement_limit_allows_repeated_postponement() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.postpone.mini.max_postponements = None;
+        scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+        let mut now = 20;
+
+        for expected_count in 1..=3 {
+            assert!(scheduler.status(clock(now)).can_postpone);
+            scheduler
+                .handle_command(&Command::Postpone, clock(now))
+                .unwrap();
+            assert_eq!(scheduler.status(clock(now)).postpone_count, expected_count);
+
+            let due = match scheduler.state() {
+                SchedulerState::Running { context } => context.next_due_mono_ms,
+                state => panic!("unexpected state {state:?}"),
+            };
+            let effects = scheduler.handle_event(SchedulerEvent::Tick, clock(due));
+            let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+                panic!("expected a postponed overlay");
+            };
+            assert!(spec.can_postpone);
+            now = due + 20;
+        }
+    }
+
+    #[test]
+    fn mini_postpone_can_be_disabled_independently() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.postpone.mini.enabled = false;
+        let effects = scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+        let Effect::StartOverlay(spec) = &effects[0] else {
+            panic!("expected an overlay");
+        };
+        assert!(!spec.can_postpone);
+        assert!(!scheduler.status(clock(20)).can_postpone);
+        assert_eq!(
+            scheduler.handle_command(&Command::Postpone, clock(20)),
+            Err(SchedulerError::PostponeDisabled)
+        );
+    }
+
+    #[test]
+    fn mini_skip_can_be_disabled_independently() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.skip.mini.enabled = false;
+        let effects = scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+        let Effect::StartOverlay(spec) = &effects[0] else {
+            panic!("expected an overlay");
+        };
+        assert!(!spec.can_skip);
+        assert!(spec.can_postpone);
+        assert!(!scheduler.status(clock(20)).can_skip);
+        assert!(scheduler.status(clock(20)).can_postpone);
+        assert_eq!(
+            scheduler.handle_command(&Command::Skip, clock(20)),
+            Err(SchedulerError::SkipDisabled)
+        );
+        assert_eq!(
+            scheduler.handle_command(&Command::Pause { duration: None }, clock(20)),
+            Err(SchedulerError::SkipDisabled)
+        );
+        assert_eq!(
+            scheduler.handle_command(&Command::Reset, clock(20)),
+            Err(SchedulerError::SkipDisabled)
+        );
+        assert!(
+            scheduler
+                .handle_command(&Command::Postpone, clock(20))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn long_skip_can_remain_enabled() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.skip.mini.enabled = false;
+        let effects = scheduler.handle_command(&Command::Long, clock(0)).unwrap();
+        let Effect::StartOverlay(spec) = &effects[0] else {
+            panic!("expected an overlay");
+        };
+        assert!(spec.can_skip);
+        assert!(scheduler.status(clock(20)).can_skip);
+        assert!(scheduler.handle_command(&Command::Skip, clock(20)).is_ok());
+    }
+
+    #[test]
+    fn long_postpone_can_remain_enabled() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.postpone.mini.enabled = false;
+        scheduler.handle_command(&Command::Long, clock(0)).unwrap();
+        assert!(scheduler.status(clock(20)).can_postpone);
+        assert!(
+            scheduler
+                .handle_command(&Command::Postpone, clock(20))
+                .is_ok()
         );
     }
 

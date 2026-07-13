@@ -137,6 +137,7 @@ dependencies = [
  "breakd-core",
  "breakd-daemon",
  "breakd-ipc",
+ "breakd-settings",
  "breakd-wayland-overlay",
  "clap",
  "serde_json",
@@ -176,6 +177,7 @@ dependencies = [
  "breakd-ipc",
  "breakd-platform-linux",
  "breakd-scheduler",
+ "breakd-tray",
  "serde_json",
  "tokio",
  "tracing",
@@ -228,6 +230,25 @@ dependencies = [
  "proptest",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "breakd-settings"
+version = "0.1.0"
+dependencies = [
+ "breakd-config",
+ "breakd-core",
+ "glib",
+ "gtk4",
+]
+
+[[package]]
+name = "breakd-tray"
+version = "0.1.0"
+dependencies = [
+ "breakd-core",
+ "ksni",
+ "tokio",
 ]
 
 [[package]]
@@ -936,6 +957,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "ksni"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da9eeb3f510b6148ae68f963af2c1fbb0de4d9e4e05f82813cfb319837c3ad2b"
+dependencies = [
+ "futures-util",
+ "pastey",
+ "serde",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1106,6 +1140,12 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pin-project-lite"

@@ -12,6 +12,7 @@ breakd-core = { path = "../core" }
 breakd-ipc = { path = "../ipc" }
 breakd-platform-linux = { path = "../platform-linux" }
 breakd-scheduler = { path = "../scheduler" }
+breakd-tray = { path = "../tray" }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

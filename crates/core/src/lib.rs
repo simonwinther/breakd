@@ -173,8 +173,11 @@ pub struct NotificationsConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostponeRule {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub duration: DurationMs,
-    pub max_count: u32,
+    #[serde(default, alias = "max_count", skip_serializing_if = "Option::is_none")]
+    pub max_postponements: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,10 +187,29 @@ pub struct PostponeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkipRule {
+    pub enabled: bool,
+}
+
+impl Default for SkipRule {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkipConfig {
+    pub mini: SkipRule,
+    pub long: SkipRule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrictConfig {
     pub mode: StrictMode,
     pub minimum_visible: DurationMs,
     pub allow_postpone_during_lockout: bool,
+    #[serde(default)]
+    pub inhibit_shortcuts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,6 +278,8 @@ pub struct StartupConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HyprlandConfig {
     pub enabled: bool,
+    #[serde(default)]
+    pub submap_fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,11 +288,24 @@ pub struct LoggingConfig {
     pub format: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrayConfig {
+    pub enabled: bool,
+}
+
+impl Default for TrayConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub schema_version: u32,
     pub schedule: ScheduleConfig,
     pub notifications: NotificationsConfig,
+    #[serde(default)]
+    pub skip: SkipConfig,
     pub postpone: PostponeConfig,
     pub strict: StrictConfig,
     pub display: DisplayConfig,
@@ -278,7 +315,13 @@ pub struct AppConfig {
     pub fullscreen: FullscreenConfig,
     pub startup: StartupConfig,
     pub hyprland: HyprlandConfig,
+    #[serde(default)]
+    pub tray: TrayConfig,
     pub logging: LoggingConfig,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,6 +458,7 @@ pub struct OverlaySpec {
     pub kind: BreakKind,
     pub duration: DurationMs,
     pub strict_remaining: DurationMs,
+    pub can_skip: bool,
     pub can_postpone: bool,
     pub message: Option<String>,
     pub socket_path: String,

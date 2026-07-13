@@ -42,6 +42,8 @@ package() {
   install -Dm755 "$srcdir/target/release/breakd" "$pkgdir/usr/bin/breakd"
   install -Dm644 packaging/systemd/breakd.service \
     "$pkgdir/usr/lib/systemd/user/breakd.service"
+  install -Dm644 packaging/io.github.simonwinther.breakd.settings.desktop \
+    "$pkgdir/usr/share/applications/io.github.simonwinther.breakd.settings.desktop"
   install -Dm644 config.example.toml \
     "$pkgdir/usr/share/doc/breakd/config.example.toml"
   install -Dm644 README.md "$pkgdir/usr/share/doc/breakd/README.md"
