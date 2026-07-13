@@ -25,6 +25,8 @@ enum CliCommand {
     Pause { duration: Option<String> },
     /// Resume a paused schedule.
     Resume,
+    #[command(hide = true)]
+    ResumeBreak,
     /// Reset cadence and counters.
     Reset,
     /// Skip the active break when policy allows it.
@@ -86,6 +88,7 @@ async fn execute(arguments: Arguments) -> Result<()> {
             send(Command::Pause { duration }, false).await
         }
         CliCommand::Resume => send(Command::Resume, false).await,
+        CliCommand::ResumeBreak => send(Command::ResumeBreak, false).await,
         CliCommand::Reset => send(Command::Reset, false).await,
         CliCommand::Skip => send(Command::Skip, false).await,
         CliCommand::Postpone => send(Command::Postpone, false).await,

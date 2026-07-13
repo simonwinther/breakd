@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc='Wayland-native break reminder with multi-monitor overlays'
 arch=('x86_64')
 url='https://github.com/simonwinther/breakd'
-license=('MIT')
+license=('MIT' 'BSD-2-Clause')
 depends=('cairo' 'glib2' 'glibc' 'graphene' 'gtk4' 'gtk4-layer-shell')
 makedepends=('cargo' 'pkgconf')
 options=('!debug')
@@ -48,4 +48,6 @@ package() {
     "$pkgdir/usr/share/doc/breakd/config.example.toml"
   install -Dm644 README.md "$pkgdir/usr/share/doc/breakd/README.md"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/breakd/LICENSE"
+  install -Dm644 THIRD_PARTY_NOTICES.md \
+    "$pkgdir/usr/share/licenses/breakd/THIRD_PARTY_NOTICES.md"
 }

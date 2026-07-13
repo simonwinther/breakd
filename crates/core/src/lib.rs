@@ -163,6 +163,11 @@ pub struct ScheduleConfig {
     pub long: LongBreakTiming,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionConfig {
+    pub manual_resume: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationsConfig {
     pub enabled: bool,
@@ -303,6 +308,8 @@ impl Default for TrayConfig {
 pub struct AppConfig {
     pub schema_version: u32,
     pub schedule: ScheduleConfig,
+    #[serde(default)]
+    pub completion: CompletionConfig,
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub skip: SkipConfig,
@@ -425,6 +432,7 @@ pub enum Command {
     Status,
     Pause { duration: Option<DurationMs> },
     Resume,
+    ResumeBreak,
     Reset,
     Skip,
     Postpone,
@@ -460,6 +468,7 @@ pub struct OverlaySpec {
     pub strict_remaining: DurationMs,
     pub can_skip: bool,
     pub can_postpone: bool,
+    pub manual_resume: bool,
     pub message: Option<String>,
     pub socket_path: String,
 }

@@ -54,6 +54,7 @@ struct SettingsWidgets {
     strict_minimum: gtk::Entry,
     allow_postpone_during_lockout: gtk::Switch,
     inhibit_shortcuts: gtk::Switch,
+    manual_resume: gtk::Switch,
     display_mode: gtk::DropDown,
     content_selector: gtk::DropDown,
     opacity: gtk::Scale,
@@ -105,6 +106,7 @@ impl SettingsWidgets {
         config.strict.allow_postpone_during_lockout =
             self.allow_postpone_during_lockout.is_active();
         config.strict.inhibit_shortcuts = self.inhibit_shortcuts.is_active();
+        config.completion.manual_resume = self.manual_resume.is_active();
 
         config.display.mode = display_mode_from_index(self.display_mode.selected());
         config.display.content_selector =
@@ -144,6 +146,7 @@ fn build_window(application: &gtk::Application, initial: AppConfig) -> gtk::Appl
         strict_minimum: action_widgets.5,
         allow_postpone_during_lockout: action_widgets.6,
         inhibit_shortcuts: action_widgets.7,
+        manual_resume: action_widgets.8,
         display_mode: desktop_widgets.0,
         content_selector: desktop_widgets.1,
         opacity: desktop_widgets.2,
@@ -369,6 +372,7 @@ type ActionPageWidgets = (
     gtk::Entry,
     gtk::Switch,
     gtk::Switch,
+    gtk::Switch,
 );
 
 fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) {
@@ -451,8 +455,22 @@ fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) 
         ],
     );
 
+    let manual_resume = gtk::Switch::builder()
+        .active(config.completion.manual_resume)
+        .valign(gtk::Align::Center)
+        .build();
+    let completion_group = settings_group(
+        "Break completion",
+        "Choose when a completed break returns to the work timer.",
+        &[settings_row(
+            "Manual resume",
+            "Wait at zero until you press a key or click the overlay.",
+            &manual_resume,
+        )],
+    );
+
     (
-        settings_page(&[mini_group, long_group, strict_group]),
+        settings_page(&[mini_group, long_group, completion_group, strict_group]),
         (
             mini_skip,
             long_skip,
@@ -462,6 +480,7 @@ fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) 
             strict_minimum,
             allow_postpone_during_lockout,
             inhibit_shortcuts,
+            manual_resume,
         ),
     )
 }

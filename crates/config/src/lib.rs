@@ -6,14 +6,16 @@ use std::{
 };
 
 use breakd_core::{
-    AppConfig, BreakTiming, ContentConfig, ContentSelector, DisplayConfig, DisplayMode, DurationMs,
-    FullscreenBehavior, FullscreenConfig, HyprlandConfig, IdleConfig, KeyboardMode, Layer,
-    LoggingConfig, LongBreakTiming, MissedBreakPolicy, NotificationsConfig, PointerMode,
-    PostponeConfig, PostponeRule, RecoveryConfig, ScheduleConfig, SkipConfig, SkipRule,
-    StartupConfig, StrictConfig, StrictMode, TrayConfig,
+    AppConfig, BreakTiming, CompletionConfig, ContentConfig, ContentSelector, DisplayConfig,
+    DisplayMode, DurationMs, FullscreenBehavior, FullscreenConfig, HyprlandConfig, IdleConfig,
+    KeyboardMode, Layer, LoggingConfig, LongBreakTiming, MissedBreakPolicy, NotificationsConfig,
+    PointerMode, PostponeConfig, PostponeRule, RecoveryConfig, ScheduleConfig, SkipConfig,
+    SkipRule, StartupConfig, StrictConfig, StrictMode, TrayConfig,
 };
 use nix::unistd::Uid;
 use thiserror::Error;
+
+mod messages;
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 
@@ -53,6 +55,9 @@ pub fn defaults() -> AppConfig {
                 duration: DurationMs::from_millis(5 * 60 * 1_000),
                 after_minis: 2,
             },
+        },
+        completion: CompletionConfig {
+            manual_resume: false,
         },
         notifications: NotificationsConfig {
             enabled: true,
@@ -100,11 +105,7 @@ pub fn defaults() -> AppConfig {
         },
         content: ContentConfig {
             show_message: true,
-            messages: vec![
-                "Look away from the screen and relax your eyes.".into(),
-                "Stand up, breathe slowly, and loosen your shoulders.".into(),
-                "Let your hands rest and change your posture.".into(),
-            ],
+            messages: messages::defaults(),
         },
         idle: IdleConfig {
             enabled: true,
@@ -360,6 +361,13 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_example_matches_defaults() {
+        let decoded: AppConfig =
+            toml::from_str(include_str!("../../../config.example.toml")).unwrap();
+        assert_eq!(decoded, defaults());
+    }
+
+    #[test]
     fn invalid_opacity_is_rejected() {
         let mut config = defaults();
         config.display.opacity = 1.1;
@@ -391,6 +399,7 @@ mod tests {
     fn old_postpone_rules_remain_enabled() {
         let mut value: toml::Value = toml::from_str(&example_toml()).unwrap();
         let root = value.as_table_mut().unwrap();
+        root.remove("completion");
         root.remove("tray");
         root.remove("skip");
         root["postpone"]["mini"]
@@ -419,6 +428,7 @@ mod tests {
         assert!(decoded.skip.long.enabled);
         assert!(!decoded.strict.inhibit_shortcuts);
         assert!(!decoded.hyprland.submap_fallback);
+        assert!(!decoded.completion.manual_resume);
         assert!(decoded.tray.enabled);
     }
 

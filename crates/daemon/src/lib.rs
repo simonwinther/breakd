@@ -114,7 +114,8 @@ pub async fn run() -> Result<()> {
                 if let Some((session_id, reason)) = overlay.poll_exit().await? {
                     let status = scheduler.status(now);
                     if status.active_session == Some(session_id)
-                        && status.remaining_ms.unwrap_or_default() > 1_000
+                        && (status.remaining_ms.unwrap_or_default() > 1_000
+                            || status.awaiting_resume)
                     {
                         let previous = scheduler.state().clone();
                         let effects = scheduler.handle_event(
@@ -623,6 +624,7 @@ fn command_message(command: &Command) -> &'static str {
     match command {
         Command::Pause { .. } => "schedule paused",
         Command::Resume => "schedule resumed",
+        Command::ResumeBreak => "break completed",
         Command::Reset => "schedule reset",
         Command::Skip => "break skipped",
         Command::Postpone => "break postponed",

@@ -82,6 +82,21 @@ max_postponements = 2
 
 `max_postponements` counts postponements within one break cycle. Omit it for unlimited postponements, which is the default. When an action is disabled or its limit has been reached, its button is omitted and its CLI command returns an error. Disabling skip also prevents pause, reset, or toggle from dismissing an active break early. Mini and long policies do not affect each other.
 
+### Manual resume
+
+Manual resume keeps the overlay open after the countdown reaches zero. Press any
+key or click the overlay when you return, and the next work interval starts from
+that confirmation. The setting applies to both mini and long breaks:
+
+```toml
+[completion]
+manual_resume = true
+```
+
+You can also enable it under Actions in `breakd settings`. While the overlay is
+waiting at zero, it captures the confirmation even when normal pointer input is
+set to `controls` or `none`.
+
 ### Tray
 
 The StatusNotifierItem tray is enabled by default:
@@ -221,6 +236,8 @@ install -Dm644 packaging/systemd/breakd-local.service \
   ~/.config/systemd/user/breakd.service
 install -Dm644 packaging/io.github.simonwinther.breakd.settings.desktop \
   ~/.local/share/applications/io.github.simonwinther.breakd.settings.desktop
+install -Dm644 THIRD_PARTY_NOTICES.md \
+  ~/.local/share/licenses/breakd/THIRD_PARTY_NOTICES.md
 install -Dm600 config.example.toml ~/.config/breakd/config.toml
 systemctl --user daemon-reload
 systemctl --user enable --now breakd.service

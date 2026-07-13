@@ -30,6 +30,8 @@ pub struct ActiveBreak {
     pub started_boot_ms: u64,
     pub ends_boot_ms: u64,
     pub strict_until_boot_ms: u64,
+    #[serde(default)]
+    pub manual_resume: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +126,7 @@ pub struct SchedulerStatus {
     pub paused: bool,
     pub break_kind: Option<BreakKind>,
     pub remaining_ms: Option<u64>,
+    pub awaiting_resume: bool,
     pub minis_since_long: u32,
     pub active_session: Option<BreakSessionId>,
     pub postpone_count: u32,
@@ -147,6 +150,10 @@ pub enum SchedulerError {
     PostponeDisabled,
     #[error("the scheduler is already paused")]
     AlreadyPaused,
+    #[error("the break has not finished or manual resume is disabled")]
+    NotAwaitingResume,
+    #[error("the completed break is waiting for manual resume")]
+    AwaitingResume,
     #[error("the scheduler is not paused")]
     NotPaused,
     #[error("command is handled by the daemon rather than the scheduler")]
@@ -236,7 +243,7 @@ impl Scheduler {
 
     pub fn startup_effects(&self, now: ClockSample) -> Vec<Effect> {
         self.active_break()
-            .filter(|active| active.ends_boot_ms > now.boottime_ms)
+            .filter(|active| active.manual_resume || active.ends_boot_ms > now.boottime_ms)
             .map(|active| vec![Effect::StartOverlay(self.overlay_spec(active, now))])
             .unwrap_or_default()
     }
@@ -249,7 +256,16 @@ impl Scheduler {
             SchedulerEvent::SuspendEnded => self.resume_suspended(SuspendReason::Sleep, now),
             SchedulerEvent::LockStarted => self.suspend(SuspendReason::Lock, now),
             SchedulerEvent::LockEnded => self.resume_suspended(SuspendReason::Lock, now),
-            SchedulerEvent::IdleThresholdReached => self.enter_idle_reset(now),
+            SchedulerEvent::IdleThresholdReached => {
+                if self
+                    .active_break()
+                    .is_some_and(|active| active.manual_resume)
+                {
+                    Vec::new()
+                } else {
+                    self.enter_idle_reset(now)
+                }
+            }
             SchedulerEvent::ActivityResumed => {
                 if matches!(self.state, SchedulerState::IdleReset { .. }) {
                     self.state = Self::fresh_running(&self.config, now);
@@ -287,6 +303,7 @@ impl Scheduler {
         match command {
             Command::Pause { duration } => self.pause(*duration, now),
             Command::Resume => self.resume_paused(now),
+            Command::ResumeBreak => self.resume_break(now),
             Command::Reset => {
                 self.ensure_dismissal_allowed(now)?;
                 Ok(self.reset(now))
@@ -318,6 +335,7 @@ impl Scheduler {
             self.state,
             SchedulerState::PausedIndefinitely { .. } | SchedulerState::PausedUntil { .. }
         );
+        let awaiting_resume = active.is_some_and(|active| awaiting_manual_resume(active, now));
         let remaining_ms = if let Some(active) = active {
             Some(active.ends_boot_ms.saturating_sub(now.boottime_ms))
         } else {
@@ -330,6 +348,7 @@ impl Scheduler {
                 context.and_then(|context| context.pending.as_ref().map(|due| due.kind))
             }),
             remaining_ms,
+            awaiting_resume,
             minis_since_long: context.map_or(0, |context| context.minis_since_long),
             active_session: active.map(|active| active.session_id),
             postpone_count: active
@@ -340,11 +359,13 @@ impl Scheduler {
                 })
                 .unwrap_or(0),
             can_skip: !paused
+                && !awaiting_resume
                 && active.is_some_and(|active| {
                     self.skip_available(active.due.kind)
                         && now.boottime_ms >= active.strict_until_boot_ms
                 }),
             can_postpone: !paused
+                && !awaiting_resume
                 && active.is_some_and(|active| self.postpone_allowed(active, now)),
         }
     }
@@ -404,7 +425,7 @@ impl Scheduler {
                 self.begin_scheduled_break(BreakKind::Long, context, now)
             }
             SchedulerState::MiniBreak { active } | SchedulerState::LongBreak { active }
-                if now.boottime_ms >= active.ends_boot_ms =>
+                if now.boottime_ms >= active.ends_boot_ms && !active.manual_resume =>
             {
                 self.finish_active(active, now)
             }
@@ -501,6 +522,7 @@ impl Scheduler {
             started_boot_ms: now.boottime_ms,
             ends_boot_ms,
             strict_until_boot_ms,
+            manual_resume: self.config.completion.manual_resume,
         };
         let effect = Effect::StartOverlay(self.overlay_spec(&active, now));
         self.state = match kind {
@@ -539,8 +561,22 @@ impl Scheduler {
         Ok(self.finish_active(active, now))
     }
 
+    fn resume_break(&mut self, now: ClockSample) -> Result<Vec<Effect>, SchedulerError> {
+        let active = self
+            .active_break()
+            .cloned()
+            .ok_or(SchedulerError::NoActiveBreak)?;
+        if !awaiting_manual_resume(&active, now) {
+            return Err(SchedulerError::NotAwaitingResume);
+        }
+        Ok(self.finish_active(active, now))
+    }
+
     fn ensure_dismissal_allowed(&self, now: ClockSample) -> Result<(), SchedulerError> {
         if let Some(active) = self.active_break() {
+            if awaiting_manual_resume(active, now) {
+                return Err(SchedulerError::AwaitingResume);
+            }
             if !self.skip_available(active.due.kind) {
                 return Err(SchedulerError::SkipDisabled);
             }
@@ -556,6 +592,9 @@ impl Scheduler {
             .active_break()
             .cloned()
             .ok_or(SchedulerError::NoActiveBreak)?;
+        if awaiting_manual_resume(&active, now) {
+            return Err(SchedulerError::AwaitingResume);
+        }
         let rule = match active.due.kind {
             BreakKind::Mini => &self.config.postpone.mini,
             BreakKind::Long => &self.config.postpone.long,
@@ -665,7 +704,9 @@ impl Scheduler {
             return Vec::new();
         }
         let elapsed_boot = now.boottime_ms.saturating_sub(started_at.boottime_ms);
-        if elapsed_boot >= self.config.idle.reset_after.as_millis() {
+        let holds_for_manual_resume =
+            active_break_in(&inner).is_some_and(|active| active.manual_resume);
+        if elapsed_boot >= self.config.idle.reset_after.as_millis() && !holds_for_manual_resume {
             self.state = Self::fresh_running(&self.config, now);
             return Vec::new();
         }
@@ -733,8 +774,10 @@ impl Scheduler {
     fn overlay_spec(&self, active: &ActiveBreak, now: ClockSample) -> OverlaySpec {
         let message =
             if self.config.content.show_message && !self.config.content.messages.is_empty() {
-                let index =
-                    active.context.minis_since_long as usize % self.config.content.messages.len();
+                let index = message_index(
+                    active.due.id.0.as_u128(),
+                    self.config.content.messages.len(),
+                );
                 Some(self.config.content.messages[index].clone())
             } else {
                 None
@@ -748,6 +791,7 @@ impl Scheduler {
             ),
             can_skip: self.skip_available(active.due.kind),
             can_postpone: self.postpone_available(active),
+            manual_resume: active.manual_resume,
             message,
             socket_path: self.socket_path.clone(),
         }
@@ -817,7 +861,7 @@ fn state_is_overdue(state: &SchedulerState, now: ClockSample) -> bool {
         | SchedulerState::PreMiniBreak { context }
         | SchedulerState::PreLongBreak { context } => now.monotonic_ms >= context.next_due_mono_ms,
         SchedulerState::MiniBreak { active } | SchedulerState::LongBreak { active } => {
-            now.boottime_ms >= active.ends_boot_ms
+            !active.manual_resume && now.boottime_ms >= active.ends_boot_ms
         }
         SchedulerState::PausedIndefinitely { .. }
         | SchedulerState::PausedUntil { .. }
@@ -887,6 +931,14 @@ fn title_kind(kind: BreakKind) -> &'static str {
     }
 }
 
+fn message_index(due_id: u128, message_count: usize) -> usize {
+    (due_id % message_count as u128) as usize
+}
+
+fn awaiting_manual_resume(active: &ActiveBreak, now: ClockSample) -> bool {
+    active.manual_resume && now.boottime_ms >= active.ends_boot_ms
+}
+
 #[cfg(test)]
 mod tests {
     use breakd_config::defaults;
@@ -914,6 +966,113 @@ mod tests {
         config.postpone.mini.max_postponements = Some(1);
         config.postpone.long.max_postponements = Some(1);
         Scheduler::new(config, "boot".into(), clock(0), "/tmp/breakd.sock".into())
+    }
+
+    #[test]
+    fn message_selection_uses_the_break_id() {
+        assert_eq!(message_index(0, 3), 0);
+        assert_eq!(message_index(1, 3), 1);
+        assert_eq!(message_index(5, 3), 2);
+    }
+
+    #[test]
+    fn manual_resume_waits_after_a_mini_break() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.completion.manual_resume = true;
+        let effects = scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+        let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+            panic!("expected an overlay");
+        };
+        assert!(spec.manual_resume);
+        assert_eq!(
+            scheduler.handle_command(&Command::ResumeBreak, clock(99)),
+            Err(SchedulerError::NotAwaitingResume)
+        );
+
+        assert!(
+            scheduler
+                .handle_event(SchedulerEvent::Tick, clock(100))
+                .is_empty()
+        );
+        let status = scheduler.status(clock(100));
+        assert!(status.awaiting_resume);
+        assert!(!status.can_skip);
+        assert!(!status.can_postpone);
+        assert_eq!(
+            scheduler.handle_command(&Command::Skip, clock(100)),
+            Err(SchedulerError::AwaitingResume)
+        );
+
+        let effects = scheduler
+            .handle_command(&Command::ResumeBreak, clock(100))
+            .unwrap();
+        assert!(matches!(effects.as_slice(), [Effect::StopOverlay { .. }]));
+        assert!(matches!(scheduler.state(), SchedulerState::Running { .. }));
+        assert_eq!(scheduler.status(clock(100)).minis_since_long, 1);
+        assert_eq!(scheduler.status(clock(100)).remaining_ms, Some(1_000));
+    }
+
+    #[test]
+    fn manual_resume_applies_to_long_breaks() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.completion.manual_resume = true;
+        scheduler.handle_command(&Command::Long, clock(0)).unwrap();
+
+        assert!(
+            scheduler
+                .handle_event(SchedulerEvent::Tick, clock(300))
+                .is_empty()
+        );
+        assert!(scheduler.status(clock(300)).awaiting_resume);
+        scheduler
+            .handle_command(&Command::ResumeBreak, clock(300))
+            .unwrap();
+        assert!(matches!(scheduler.state(), SchedulerState::Running { .. }));
+        assert_eq!(scheduler.status(clock(300)).minis_since_long, 0);
+    }
+
+    #[test]
+    fn automatic_resume_remains_the_default() {
+        let mut scheduler = test_scheduler();
+        scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+
+        let effects = scheduler.handle_event(SchedulerEvent::Tick, clock(100));
+        assert!(matches!(effects.as_slice(), [Effect::StopOverlay { .. }]));
+        assert!(!scheduler.status(clock(100)).awaiting_resume);
+        assert!(matches!(scheduler.state(), SchedulerState::Running { .. }));
+    }
+
+    #[test]
+    fn idle_does_not_dismiss_a_manual_resume_break() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.completion.manual_resume = true;
+        scheduler.handle_command(&Command::Long, clock(0)).unwrap();
+
+        let effects = scheduler.handle_event(SchedulerEvent::IdleThresholdReached, clock(300));
+        assert!(effects.is_empty());
+        assert!(scheduler.status(clock(300)).awaiting_resume);
+        assert!(matches!(
+            scheduler.state(),
+            SchedulerState::LongBreak { .. }
+        ));
+    }
+
+    #[test]
+    fn lock_recovery_restores_an_expired_manual_resume_break() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.completion.manual_resume = true;
+        scheduler.config.recovery.wake_grace = DurationMs::from_millis(0);
+        scheduler.config.idle.reset_after = DurationMs::from_millis(500);
+        scheduler.handle_command(&Command::Long, clock(0)).unwrap();
+        scheduler.handle_event(SchedulerEvent::LockStarted, clock(10));
+
+        let effects = scheduler.handle_event(SchedulerEvent::LockEnded, clock(600));
+        let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+            panic!("expected the manual-resume overlay to be restored");
+        };
+        assert!(spec.manual_resume);
+        assert_eq!(spec.duration, DurationMs::from_millis(0));
+        assert!(scheduler.status(clock(600)).awaiting_resume);
     }
 
     #[test]
