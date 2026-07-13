@@ -2,7 +2,7 @@
 
 Break reminders for Hyprland on Wayland.
 
-## Why should I use this instead of Stretchly?
+## Why should I use this instead of [Stretchly](https://github.com/hovancik/stretchly)?
 
 Stretchly: about 408 MB across three Electron processes. `breakd`: 29 MB.
 
