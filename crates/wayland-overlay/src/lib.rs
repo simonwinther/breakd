@@ -1,0 +1,603 @@
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    process::Command,
+    rc::Rc,
+    time::{Duration, Instant},
+};
+
+use breakd_core::{
+    AppConfig, ContentSelector, DisplayMode, KeyboardMode, Layer, OutputInfo, OverlaySpec,
+    PointerMode,
+};
+use breakd_platform_linux::HyprlandClient;
+use gtk::{gdk, gio, prelude::*};
+use gtk4 as gtk;
+use gtk4_layer_shell::{Edge, KeyboardMode as LayerKeyboardMode, Layer as ShellLayer, LayerShell};
+
+pub fn run(spec: OverlaySpec, config: AppConfig) -> Result<(), String> {
+    if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland") {
+        return Err("breakd overlay requires a Wayland session".into());
+    }
+
+    let application = gtk::Application::builder()
+        .application_id("io.github.breakd.Overlay")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    application.connect_activate(move |application| {
+        if !gtk4_layer_shell::is_supported() {
+            tracing::error!("wlr-layer-shell is unavailable");
+            application.quit();
+            return;
+        }
+
+        install_css(&config);
+        let manager = Rc::new(RefCell::new(OverlayManager::new(
+            application.clone(),
+            spec.clone(),
+            config.clone(),
+        )));
+        manager.borrow_mut().reconcile();
+
+        let display = gdk::Display::default().expect("GTK activation has a display");
+        let monitors = display.monitors();
+        let manager_for_monitors = manager.clone();
+        monitors.connect_items_changed(move |_, _, _, _| {
+            manager_for_monitors.borrow_mut().reconcile();
+        });
+
+        let manager_for_timer = manager.clone();
+        glib::timeout_add_local(Duration::from_millis(200), move || {
+            let mut manager = manager_for_timer.borrow_mut();
+            if manager.update_countdown() {
+                glib::ControlFlow::Continue
+            } else {
+                manager.application.quit();
+                glib::ControlFlow::Break
+            }
+        });
+    });
+    application.run_with_args(&["breakd-overlay"]);
+    Ok(())
+}
+
+struct SurfaceWidgets {
+    monitor: gdk::Monitor,
+    content: bool,
+    input_owner: bool,
+    window: gtk::ApplicationWindow,
+    countdown: Option<gtk::Label>,
+    skip: Option<gtk::Button>,
+    postpone: Option<gtk::Button>,
+}
+
+struct OverlayManager {
+    application: gtk::Application,
+    spec: OverlaySpec,
+    config: AppConfig,
+    deadline: Instant,
+    strict_deadline: Instant,
+    surfaces: HashMap<String, SurfaceWidgets>,
+}
+
+impl OverlayManager {
+    fn new(application: gtk::Application, spec: OverlaySpec, config: AppConfig) -> Self {
+        let now = Instant::now();
+        Self {
+            application,
+            deadline: now + spec.duration.as_duration(),
+            strict_deadline: now + spec.strict_remaining.as_duration(),
+            spec,
+            config,
+            surfaces: HashMap::new(),
+        }
+    }
+
+    fn reconcile(&mut self) {
+        let display = gdk::Display::default().expect("overlay has a GDK display");
+        let monitors_model = display.monitors();
+        let monitors: Vec<(String, gdk::Monitor)> = (0..monitors_model.n_items())
+            .filter_map(|index| monitors_model.item(index))
+            .filter_map(|item| item.downcast::<gdk::Monitor>().ok())
+            .enumerate()
+            .map(|(index, monitor)| (monitor_key(&monitor, index), monitor))
+            .collect();
+        if monitors.is_empty() {
+            tracing::warn!("no GDK outputs are currently available");
+            return;
+        }
+
+        let (metadata, cursor) = if self.config.hyprland.enabled {
+            hyprland_snapshot()
+        } else {
+            (Vec::new(), None)
+        };
+        let decision = DisplayDecision::resolve(&self.config, &monitors, &metadata, cursor);
+        let desired: HashSet<_> = decision.targets.iter().cloned().collect();
+        let current_monitors: HashMap<_, _> = monitors
+            .iter()
+            .map(|(key, monitor)| (key.as_str(), monitor))
+            .collect();
+
+        self.surfaces.retain(|key, surface| {
+            if desired.contains(key)
+                && current_monitors
+                    .get(key.as_str())
+                    .is_some_and(|monitor| **monitor == surface.monitor)
+                && surface.content == decision.content.contains(key)
+                && surface.input_owner == (decision.input_owner.as_deref() == Some(key.as_str()))
+            {
+                true
+            } else {
+                surface.window.close();
+                false
+            }
+        });
+
+        for (key, monitor) in monitors {
+            if !desired.contains(&key) || self.surfaces.contains_key(&key) {
+                continue;
+            }
+            let content = decision.content.contains(&key);
+            let input_owner = decision.input_owner.as_deref() == Some(key.as_str());
+            let surface = self.create_surface(&monitor, content, input_owner);
+            self.surfaces.insert(key, surface);
+        }
+    }
+
+    fn create_surface(
+        &self,
+        monitor: &gdk::Monitor,
+        content: bool,
+        input_owner: bool,
+    ) -> SurfaceWidgets {
+        let window = gtk::ApplicationWindow::builder()
+            .application(&self.application)
+            .decorated(false)
+            .build();
+        window.set_default_size(0, 0);
+        window.add_css_class("breakd-overlay");
+        window.init_layer_shell();
+        window.set_namespace(Some("breakd-overlay"));
+        window.set_monitor(Some(monitor));
+        window.set_layer(match self.config.display.layer {
+            Layer::Overlay => ShellLayer::Overlay,
+            Layer::Top => ShellLayer::Top,
+        });
+        window.set_exclusive_zone(-1);
+        for edge in [Edge::Top, Edge::Right, Edge::Bottom, Edge::Left] {
+            window.set_anchor(edge, true);
+        }
+        window.set_keyboard_mode(if content && input_owner {
+            match self.config.display.keyboard_mode {
+                KeyboardMode::None => LayerKeyboardMode::None,
+                KeyboardMode::OnDemand => LayerKeyboardMode::OnDemand,
+                KeyboardMode::Exclusive => LayerKeyboardMode::Exclusive,
+            }
+        } else {
+            LayerKeyboardMode::None
+        });
+
+        let (panel, countdown, skip, postpone) = if content {
+            let widgets = build_content(&window, &self.spec);
+            (Some(widgets.0), Some(widgets.1), Some(widgets.2), widgets.3)
+        } else {
+            (None, None, None, None)
+        };
+
+        configure_input_region(&window, panel.as_ref(), self.config.display.pointer_mode);
+        window.present();
+        SurfaceWidgets {
+            monitor: monitor.clone(),
+            content,
+            input_owner,
+            window,
+            countdown,
+            skip,
+            postpone,
+        }
+    }
+
+    fn update_countdown(&mut self) -> bool {
+        let now = Instant::now();
+        let remaining = self.deadline.saturating_duration_since(now);
+        let text = format_countdown(remaining);
+        let strict_complete = now >= self.strict_deadline;
+        for surface in self.surfaces.values() {
+            if let Some(label) = &surface.countdown {
+                label.set_text(&text);
+            }
+            if let Some(button) = &surface.skip {
+                button.set_sensitive(strict_complete);
+            }
+            if let Some(button) = &surface.postpone {
+                button.set_sensitive(
+                    strict_complete || self.config.strict.allow_postpone_during_lockout,
+                );
+            }
+        }
+        !remaining.is_zero()
+    }
+}
+
+fn build_content(
+    window: &gtk::ApplicationWindow,
+    spec: &OverlaySpec,
+) -> (gtk::Box, gtk::Label, gtk::Button, Option<gtk::Button>) {
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    panel.set_halign(gtk::Align::Center);
+    panel.set_valign(gtk::Align::Center);
+    panel.set_width_request(560);
+    panel.add_css_class("breakd-panel");
+
+    let title = gtk::Label::new(Some(match spec.kind {
+        breakd_core::BreakKind::Mini => "Mini break",
+        breakd_core::BreakKind::Long => "Long break",
+    }));
+    title.add_css_class("breakd-title");
+    panel.append(&title);
+
+    let countdown = gtk::Label::new(Some(&format_countdown(spec.duration.as_duration())));
+    countdown.add_css_class("breakd-countdown");
+    panel.append(&countdown);
+
+    if let Some(message) = &spec.message {
+        let message_label = gtk::Label::new(Some(message));
+        message_label.set_wrap(true);
+        message_label.set_justify(gtk::Justification::Center);
+        message_label.add_css_class("breakd-message");
+        panel.append(&message_label);
+    }
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    actions.set_halign(gtk::Align::Center);
+    actions.set_homogeneous(true);
+    let skip = gtk::Button::with_label("Skip");
+    skip.add_css_class("breakd-action");
+    skip.connect_clicked(|_| invoke_cli("skip"));
+    actions.append(&skip);
+
+    let postpone = spec.can_postpone.then(|| {
+        let button = gtk::Button::with_label("Postpone");
+        button.add_css_class("breakd-action");
+        button.connect_clicked(|_| invoke_cli("postpone"));
+        actions.append(&button);
+        button
+    });
+    panel.append(&actions);
+    window.set_child(Some(&panel));
+    (panel, countdown, skip, postpone)
+}
+
+fn configure_input_region(
+    window: &gtk::ApplicationWindow,
+    panel: Option<&gtk::Box>,
+    mode: PointerMode,
+) {
+    if mode == PointerMode::Block {
+        return;
+    }
+    if mode == PointerMode::Controls
+        && let Some(panel) = panel
+    {
+        let panel = panel.clone();
+        window.connect_realize(move |window| {
+            let Some(surface) = window.surface() else {
+                return;
+            };
+            let window = window.downgrade();
+            let panel = panel.downgrade();
+            surface.connect_layout(move |_, _, _| {
+                let (Some(window), Some(panel)) = (window.upgrade(), panel.upgrade()) else {
+                    return;
+                };
+                set_panel_input_region(&window, &panel);
+            });
+        });
+        return;
+    }
+    window.connect_realize(|window| {
+        if let Some(surface) = window.surface() {
+            let region = gtk::cairo::Region::create();
+            surface.set_input_region(Some(&region));
+        }
+    });
+}
+
+fn set_panel_input_region(window: &gtk::ApplicationWindow, panel: &gtk::Box) {
+    let (Some(surface), Some(bounds)) = (window.surface(), panel.compute_bounds(window)) else {
+        return;
+    };
+    let rectangle = gtk::cairo::RectangleInt::new(
+        bounds.x().floor() as i32,
+        bounds.y().floor() as i32,
+        bounds.width().ceil() as i32,
+        bounds.height().ceil() as i32,
+    );
+    let region = gtk::cairo::Region::create_rectangle(&rectangle);
+    surface.set_input_region(Some(&region));
+}
+
+fn invoke_cli(command: &str) {
+    match std::env::current_exe().and_then(|executable| {
+        Command::new(executable)
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+    }) {
+        Ok(()) => {}
+        Err(error) => tracing::warn!(%error, command, "failed to invoke breakd command"),
+    }
+}
+
+fn install_css(config: &AppConfig) {
+    let (red, green, blue) = parse_hex_color(&config.display.dim_color).unwrap_or((16, 20, 24));
+    let css = format!(
+        r#"
+        .breakd-overlay {{
+            background-color: rgba({red}, {green}, {blue}, {opacity});
+            color: #f4f7f8;
+        }}
+        .breakd-panel {{
+            background-color: rgba(20, 24, 28, 0.94);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 8px;
+            padding: 36px 42px;
+        }}
+        .breakd-title {{ font-size: 26px; font-weight: 600; }}
+        .breakd-countdown {{ font-size: 64px; font-weight: 700; }}
+        .breakd-message {{ font-size: 18px; }}
+        .breakd-action {{ min-width: 120px; min-height: 42px; font-size: 16px; }}
+        "#,
+        opacity = config.display.opacity,
+    );
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(&css);
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
+#[derive(Default)]
+struct DisplayDecision {
+    targets: Vec<String>,
+    content: HashSet<String>,
+    input_owner: Option<String>,
+}
+
+impl DisplayDecision {
+    fn resolve(
+        config: &AppConfig,
+        monitors: &[(String, gdk::Monitor)],
+        metadata: &[OutputInfo],
+        cursor: Option<(i32, i32)>,
+    ) -> Self {
+        let all: Vec<_> = monitors.iter().map(|(key, _)| key.clone()).collect();
+        let selected =
+            select_monitor(config, &all, metadata, cursor).or_else(|| all.first().cloned());
+        match config.display.mode {
+            DisplayMode::All => Self {
+                targets: all.clone(),
+                content: all.iter().cloned().collect(),
+                input_owner: selected,
+            },
+            DisplayMode::DimAllContentOne => Self {
+                targets: all,
+                content: selected.iter().cloned().collect(),
+                input_owner: selected,
+            },
+            _ => Self {
+                targets: selected.iter().cloned().collect(),
+                content: selected.iter().cloned().collect(),
+                input_owner: selected,
+            },
+        }
+    }
+}
+
+fn select_monitor(
+    config: &AppConfig,
+    available: &[String],
+    metadata: &[OutputInfo],
+    cursor: Option<(i32, i32)>,
+) -> Option<String> {
+    let selector = match config.display.mode {
+        DisplayMode::Focused => ContentSelector::Focused,
+        DisplayMode::Cursor => ContentSelector::Cursor,
+        DisplayMode::Primary => ContentSelector::Primary,
+        DisplayMode::Configured => ContentSelector::Configured,
+        DisplayMode::All | DisplayMode::DimAllContentOne => config.display.content_selector,
+    };
+    resolve_selector(config, selector, available, metadata, cursor).or_else(|| {
+        config
+            .display
+            .fallback
+            .iter()
+            .find_map(|fallback| resolve_selector(config, *fallback, available, metadata, cursor))
+    })
+}
+
+fn resolve_selector(
+    config: &AppConfig,
+    selector: ContentSelector,
+    available: &[String],
+    metadata: &[OutputInfo],
+    cursor: Option<(i32, i32)>,
+) -> Option<String> {
+    let connector = match selector {
+        ContentSelector::Focused => metadata.iter().find(|output| output.focused),
+        ContentSelector::Cursor => cursor.and_then(|(cursor_x, cursor_y)| {
+            metadata
+                .iter()
+                .find(|output| output_contains(output, cursor_x, cursor_y))
+        }),
+        ContentSelector::Primary => config
+            .display
+            .primary_monitor
+            .as_ref()
+            .and_then(|selector| {
+                metadata
+                    .iter()
+                    .find(|output| output.identity.matches_selector(selector))
+            }),
+        ContentSelector::Configured => {
+            config
+                .display
+                .preferred_monitor
+                .as_ref()
+                .and_then(|selector| {
+                    metadata
+                        .iter()
+                        .find(|output| output.identity.matches_selector(selector))
+                })
+        }
+    }
+    .and_then(|output| output.identity.connector.as_ref())?;
+    available
+        .iter()
+        .find(|key| key.as_str() == connector)
+        .cloned()
+}
+
+fn output_contains(output: &OutputInfo, x: i32, y: i32) -> bool {
+    let (width, height) = if matches!(output.transform, 1 | 3 | 5 | 7) {
+        (output.height, output.width)
+    } else {
+        (output.width, output.height)
+    };
+    let logical_width = (f64::from(width) / output.scale).round() as i32;
+    let logical_height = (f64::from(height) / output.scale).round() as i32;
+    x >= output.x && x < output.x + logical_width && y >= output.y && y < output.y + logical_height
+}
+
+fn hyprland_snapshot() -> (Vec<OutputInfo>, Option<(i32, i32)>) {
+    std::thread::spawn(|| {
+        let Ok(client) = HyprlandClient::from_env() else {
+            return (Vec::new(), None);
+        };
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+        else {
+            return (Vec::new(), None);
+        };
+        runtime.block_on(async {
+            let outputs = client.outputs().await.unwrap_or_default();
+            let cursor = client.cursor_position().await.ok();
+            (outputs, cursor)
+        })
+    })
+    .join()
+    .unwrap_or_default()
+}
+
+fn monitor_key(monitor: &gdk::Monitor, index: usize) -> String {
+    monitor
+        .connector()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| {
+            monitor
+                .description()
+                .map(|value| format!("{}#{index}", value))
+                .unwrap_or_else(|| format!("output#{index}"))
+        })
+}
+
+fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
+    let value = value.strip_prefix('#')?;
+    (value.len() == 6).then_some((
+        u8::from_str_radix(&value[0..2], 16).ok()?,
+        u8::from_str_radix(&value[2..4], 16).ok()?,
+        u8::from_str_radix(&value[4..6], 16).ok()?,
+    ))
+}
+
+fn format_countdown(duration: Duration) -> String {
+    let seconds = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0));
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use breakd_core::MonitorIdentity;
+
+    use super::*;
+
+    #[test]
+    fn countdown_rounds_up() {
+        assert_eq!(format_countdown(Duration::from_millis(1_001)), "00:02");
+        assert_eq!(format_countdown(Duration::from_secs(65)), "01:05");
+    }
+
+    #[test]
+    fn parses_rgb_color() {
+        assert_eq!(parse_hex_color("#101418"), Some((16, 20, 24)));
+        assert_eq!(parse_hex_color("invalid"), None);
+    }
+
+    #[test]
+    fn cursor_geometry_accounts_for_rotation_and_scale() {
+        let output = OutputInfo {
+            identity: MonitorIdentity {
+                connector: Some("DP-1".into()),
+                make: None,
+                model: None,
+                serial: None,
+                description: None,
+                physical_mm: None,
+            },
+            width: 1920,
+            height: 1080,
+            x: -720,
+            y: -100,
+            scale: 1.5,
+            transform: 3,
+            refresh_hz: 60.0,
+            focused: false,
+            enabled: true,
+        };
+        assert!(output_contains(&output, -1, 1_000));
+        assert!(!output_contains(&output, 1, 1_000));
+        assert!(!output_contains(&output, -1, 1_181));
+    }
+
+    #[test]
+    fn stale_configured_monitor_falls_back_to_focused_output() {
+        let mut config = breakd_config::defaults();
+        config.display.mode = DisplayMode::Configured;
+        config.display.preferred_monitor = Some("connector:missing".into());
+        config.display.fallback = vec![ContentSelector::Focused];
+        let metadata = vec![OutputInfo {
+            identity: MonitorIdentity {
+                connector: Some("DP-2".into()),
+                make: Some("AOC".into()),
+                model: Some("Panel".into()),
+                serial: Some("123".into()),
+                description: None,
+                physical_mm: None,
+            },
+            width: 1920,
+            height: 1080,
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            transform: 0,
+            refresh_hz: 165.0,
+            focused: true,
+            enabled: true,
+        }];
+        assert_eq!(
+            select_monitor(&config, &["DP-2".into()], &metadata, None),
+            Some("DP-2".into())
+        );
+    }
+}
