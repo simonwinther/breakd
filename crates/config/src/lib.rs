@@ -1,11 +1,16 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    io::Write,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 use breakd_core::{
     AppConfig, BreakTiming, ContentConfig, ContentSelector, DisplayConfig, DisplayMode, DurationMs,
     FullscreenBehavior, FullscreenConfig, HyprlandConfig, IdleConfig, KeyboardMode, Layer,
     LoggingConfig, LongBreakTiming, MissedBreakPolicy, NotificationsConfig, PointerMode,
-    PostponeConfig, PostponeRule, RecoveryConfig, ScheduleConfig, StartupConfig, StrictConfig,
-    StrictMode,
+    PostponeConfig, PostponeRule, RecoveryConfig, ScheduleConfig, SkipConfig, SkipRule,
+    StartupConfig, StrictConfig, StrictMode, TrayConfig,
 };
 use nix::unistd::Uid;
 use thiserror::Error;
@@ -23,6 +28,13 @@ pub enum ConfigError {
     Parse {
         path: PathBuf,
         source: toml::de::Error,
+    },
+    #[error("failed to serialize configuration: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
     },
     #[error("invalid configuration: {0}")]
     Validation(String),
@@ -48,20 +60,27 @@ pub fn defaults() -> AppConfig {
             long_lead: DurationMs::from_millis(30 * 1_000),
             actions: true,
         },
+        skip: SkipConfig {
+            mini: SkipRule { enabled: true },
+            long: SkipRule { enabled: true },
+        },
         postpone: PostponeConfig {
             mini: PostponeRule {
+                enabled: true,
                 duration: DurationMs::from_millis(2 * 60 * 1_000),
-                max_count: 1,
+                max_postponements: None,
             },
             long: PostponeRule {
+                enabled: true,
                 duration: DurationMs::from_millis(5 * 60 * 1_000),
-                max_count: 1,
+                max_postponements: None,
             },
         },
         strict: StrictConfig {
             mode: StrictMode::Delay,
             minimum_visible: DurationMs::from_millis(10 * 1_000),
             allow_postpone_during_lockout: false,
+            inhibit_shortcuts: true,
         },
         display: DisplayConfig {
             mode: DisplayMode::DimAllContentOne,
@@ -107,7 +126,11 @@ pub fn defaults() -> AppConfig {
             start_paused: false,
             recover_state: true,
         },
-        hyprland: HyprlandConfig { enabled: true },
+        hyprland: HyprlandConfig {
+            enabled: true,
+            submap_fallback: true,
+        },
+        tray: TrayConfig { enabled: true },
         logging: LoggingConfig {
             level: "info".into(),
             format: "journald".into(),
@@ -163,6 +186,70 @@ pub fn load_from(path: PathBuf) -> Result<AppConfig, ConfigError> {
     Ok(config)
 }
 
+pub fn save(config: &AppConfig) -> Result<(), ConfigError> {
+    save_to(&config_path(), config)
+}
+
+pub fn save_to(path: &Path, config: &AppConfig) -> Result<(), ConfigError> {
+    validate(config)?;
+    let mut encoded = toml::to_string_pretty(config)?;
+    if !encoded.ends_with('\n') {
+        encoded.push('\n');
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        ConfigError::Validation("configuration path has no parent directory".into())
+    })?;
+    fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        ConfigError::Write {
+            path: parent.to_path_buf(),
+            source,
+        }
+    })?;
+
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    temporary
+        .write_all(encoded.as_bytes())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    temporary
+        .persist(path)
+        .map_err(|error| ConfigError::Write {
+            path: path.to_path_buf(),
+            source: error.error,
+        })?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+        ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ConfigError::Write {
+            path: parent.to_path_buf(),
+            source,
+        })
+}
+
 pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
     if config.schema_version != CONFIG_SCHEMA_VERSION {
         return Err(ConfigError::Validation(format!(
@@ -196,6 +283,21 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::Validation(
             "notification lead must be shorter than its interval".into(),
         ));
+    }
+    for (name, rule) in [
+        ("postpone.mini", &config.postpone.mini),
+        ("postpone.long", &config.postpone.long),
+    ] {
+        if rule.enabled && rule.duration.as_millis() == 0 {
+            return Err(ConfigError::Validation(format!(
+                "{name}.duration must be positive when postponement is enabled"
+            )));
+        }
+        if rule.enabled && rule.max_postponements == Some(0) {
+            return Err(ConfigError::Validation(format!(
+                "{name}.max_postponements must be positive when postponement is enabled"
+            )));
+        }
     }
     if !(0.0..=1.0).contains(&config.display.opacity) {
         return Err(ConfigError::Validation(
@@ -283,5 +385,80 @@ mod tests {
         let mut config = defaults();
         config.fullscreen.behavior = FullscreenBehavior::Postpone;
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn old_postpone_rules_remain_enabled() {
+        let mut value: toml::Value = toml::from_str(&example_toml()).unwrap();
+        let root = value.as_table_mut().unwrap();
+        root.remove("tray");
+        root.remove("skip");
+        root["postpone"]["mini"]
+            .as_table_mut()
+            .unwrap()
+            .remove("enabled");
+        root["postpone"]["long"]
+            .as_table_mut()
+            .unwrap()
+            .remove("enabled");
+        root["strict"]
+            .as_table_mut()
+            .unwrap()
+            .remove("inhibit_shortcuts");
+        root["hyprland"]
+            .as_table_mut()
+            .unwrap()
+            .remove("submap_fallback");
+        let source = toml::to_string(&value).unwrap();
+        let decoded: AppConfig = toml::from_str(&source).unwrap();
+        assert!(decoded.postpone.mini.enabled);
+        assert!(decoded.postpone.long.enabled);
+        assert_eq!(decoded.postpone.mini.max_postponements, None);
+        assert_eq!(decoded.postpone.long.max_postponements, None);
+        assert!(decoded.skip.mini.enabled);
+        assert!(decoded.skip.long.enabled);
+        assert!(!decoded.strict.inhibit_shortcuts);
+        assert!(!decoded.hyprland.submap_fallback);
+        assert!(decoded.tray.enabled);
+    }
+
+    #[test]
+    fn old_max_count_name_is_accepted() {
+        let mut value: toml::Value = toml::from_str(&example_toml()).unwrap();
+        value["postpone"]["mini"]
+            .as_table_mut()
+            .unwrap()
+            .insert("max_count".into(), toml::Value::Integer(2));
+
+        let source = toml::to_string(&value).unwrap();
+        let decoded: AppConfig = toml::from_str(&source).unwrap();
+        assert_eq!(decoded.postpone.mini.max_postponements, Some(2));
+    }
+
+    #[test]
+    fn save_is_atomic_private_and_loadable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("breakd/config.toml");
+        let config = defaults();
+
+        save_to(&path, &config).unwrap();
+
+        assert_eq!(load_from(path.clone()).unwrap(), config);
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn invalid_config_does_not_replace_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = defaults();
+        save_to(&path, &original).unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+
+        let mut invalid = original;
+        invalid.display.opacity = 2.0;
+        assert!(save_to(&path, &invalid).is_err());
+        assert_eq!(fs::read(path).unwrap(), original_bytes);
     }
 }

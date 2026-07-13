@@ -18,6 +18,10 @@ pub enum HyprlandError {
     Io(#[from] std::io::Error),
     #[error("Hyprland returned invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Hyprland command failed: {0}")]
+    Command(String),
+    #[error("invalid Hyprland submap name: {0}")]
+    InvalidSubmap(String),
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +70,56 @@ impl HyprlandClient {
         Ok(self.query_json::<Locked>("locked").await?.locked)
     }
 
+    pub async fn current_submap(&self) -> Result<String, HyprlandError> {
+        self.query_json("submap").await
+    }
+
+    pub async fn submap_exists(&self, name: &str) -> Result<bool, HyprlandError> {
+        validate_submap_name(name)?;
+        let bindings: Vec<HyprBind> = self.query_json("binds").await?;
+        Ok(bindings.iter().any(|binding| binding.submap == name))
+    }
+
+    pub async fn ensure_submap(&self, name: &str) -> Result<(), HyprlandError> {
+        validate_submap_name(name)?;
+        if self.submap_exists(name).await? {
+            return Ok(());
+        }
+
+        let setup_result = async {
+            self.command(&format!("keyword submap {name}")).await?;
+            self.command("keyword bind CTRL_ALT_SHIFT_SUPER, F24, exec, true")
+                .await?;
+            Ok::<(), HyprlandError>(())
+        }
+        .await;
+        let reset_result = self.command("keyword submap reset").await;
+        setup_result?;
+        reset_result?;
+
+        if !self.submap_exists(name).await? {
+            return Err(HyprlandError::Command(format!(
+                "submap {name} was not registered"
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn set_submap(&self, name: &str) -> Result<(), HyprlandError> {
+        validate_submap_name(name)?;
+        self.command(&format!("dispatch submap {name}")).await?;
+        Ok(())
+    }
+
+    pub async fn reset_submap_if_active(&self, name: &str) -> Result<bool, HyprlandError> {
+        validate_submap_name(name)?;
+        if self.current_submap().await? != name {
+            return Ok(false);
+        }
+        self.set_submap("reset").await?;
+        Ok(true)
+    }
+
     pub async fn query_json<T>(&self, command: &str) -> Result<T, HyprlandError>
     where
         T: serde::de::DeserializeOwned,
@@ -76,6 +130,19 @@ impl HyprlandClient {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await?;
         Ok(serde_json::from_slice(&response)?)
+    }
+
+    async fn command(&self, command: &str) -> Result<String, HyprlandError> {
+        let mut stream = UnixStream::connect(&self.command_socket).await?;
+        stream.write_all(command.as_bytes()).await?;
+        stream.shutdown().await?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await?;
+        let response = response.trim().to_owned();
+        if response.is_empty() || response.lines().any(|line| line.trim() != "ok") {
+            return Err(HyprlandError::Command(response));
+        }
+        Ok(response)
     }
 }
 
@@ -130,6 +197,36 @@ struct CursorPosition {
     y: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct HyprBind {
+    submap: String,
+}
+
+fn validate_submap_name(name: &str) -> Result<(), HyprlandError> {
+    if !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        Ok(())
+    } else {
+        Err(HyprlandError::InvalidSubmap(name.into()))
+    }
+}
+
 fn nonempty(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_submap_names_before_ipc_use() {
+        assert!(validate_submap_name("breakd").is_ok());
+        assert!(validate_submap_name("break-reminder_2").is_ok());
+        assert!(validate_submap_name("").is_err());
+        assert!(validate_submap_name("breakd;dispatch workspace 1").is_err());
+    }
 }

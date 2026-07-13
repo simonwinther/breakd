@@ -1,5 +1,5 @@
 [package]
-name = "breakd-config"
+name = "breakd-tray"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,5 @@ rust-version.workspace = true
 
 [dependencies]
 breakd-core = { path = "../core" }
-nix.workspace = true
-tempfile.workspace = true
-thiserror.workspace = true
-toml.workspace = true
+ksni.workspace = true
+tokio.workspace = true

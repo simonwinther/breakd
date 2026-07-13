@@ -15,18 +15,27 @@ mini_lead = "10s"
 long_lead = "30s"
 actions = true
 
+[skip.mini]
+enabled = true
+
+[skip.long]
+enabled = true
+
 [postpone.mini]
+enabled = true
 duration = "2m"
-max_count = 1
+# max_postponements = 2 # omit for unlimited postponements
 
 [postpone.long]
+enabled = true
 duration = "5m"
-max_count = 1
+# max_postponements = 2 # omit for unlimited postponements
 
 [strict]
 mode = "delay" # off | delay | entire
 minimum_visible = "10s"
 allow_postpone_during_lockout = false
+inhibit_shortcuts = true
 
 [display]
 mode = "dim-all-content-one" # all | focused | cursor | primary | configured | dim-all-content-one
@@ -38,7 +47,7 @@ layer = "overlay" # overlay | top
 opacity = 0.88
 dim_color = "#101418"
 pointer_mode = "block" # block | controls | none
-keyboard_mode = "on-demand" # none | on-demand | exclusive
+keyboard_mode = "on-demand" # shortcut inhibition uses exclusive focus while active
 
 [content]
 show_message = true
@@ -69,6 +78,10 @@ start_paused = false
 recover_state = true
 
 [hyprland]
+enabled = true
+submap_fallback = true # enforce blocking through a temporary Hyprland submap
+
+[tray]
 enabled = true
 
 [logging]

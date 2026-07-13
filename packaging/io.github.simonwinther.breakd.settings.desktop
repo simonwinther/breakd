@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=breakd Settings
+Comment=Configure break reminders
+Exec=breakd settings
+Icon=alarm-symbolic
+Terminal=false
+Categories=Utility;GTK;
+StartupNotify=true
