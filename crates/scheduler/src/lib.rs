@@ -1598,6 +1598,119 @@ mod tests {
     }
 
     #[test]
+    fn long_requires_both_interval_and_mini_threshold() {
+        let scheduler = test_scheduler();
+        let context = ScheduleContext {
+            cycle_started_mono_ms: 0,
+            next_due_mono_ms: 0,
+            minis_since_long: 2,
+            longs_since_rest: 0,
+            rest_cycle_started_mono_ms: 0,
+            pending: None,
+        };
+        // Mini threshold met (2 >= 2), long interval (3s) not elapsed.
+        assert_eq!(scheduler.next_kind(&context, 2_999), BreakKind::Mini);
+        // Both conditions met.
+        assert_eq!(scheduler.next_kind(&context, 3_000), BreakKind::Long);
+        // Long interval elapsed, mini threshold not met.
+        let mut context = context;
+        context.minis_since_long = 1;
+        assert_eq!(scheduler.next_kind(&context, 7_000), BreakKind::Mini);
+    }
+
+    #[test]
+    fn rest_requires_both_interval_and_long_threshold() {
+        let scheduler = test_scheduler();
+        let context = ScheduleContext {
+            cycle_started_mono_ms: 7_500,
+            next_due_mono_ms: 0,
+            minis_since_long: 0,
+            longs_since_rest: 2,
+            rest_cycle_started_mono_ms: 0,
+            pending: None,
+        };
+        // Long threshold met (2 >= 2), rest interval (8s) not elapsed.
+        assert_eq!(scheduler.next_kind(&context, 7_999), BreakKind::Mini);
+        // Both conditions met.
+        assert_eq!(scheduler.next_kind(&context, 8_000), BreakKind::Rest);
+        // Rest interval elapsed, long threshold not met.
+        let mut context = context;
+        context.longs_since_rest = 1;
+        assert_eq!(scheduler.next_kind(&context, 8_000), BreakKind::Mini);
+    }
+
+    #[test]
+    fn scheduled_breaks_honour_both_conditions_over_a_full_cadence() {
+        // Thresholds deliberately do not coincide with the interval boundaries:
+        // three minis complete at 3.3s while the long interval elapses at 2.5s,
+        // and the rest interval (9s) elapses between long-break completions.
+        let mut scheduler = test_scheduler();
+        scheduler.config.schedule.long.interval = DurationMs::from_millis(2_500);
+        scheduler.config.schedule.long.after_minis = 3;
+        scheduler.config.schedule.rest.interval = DurationMs::from_millis(9_000);
+        scheduler.config.schedule.rest.after_longs = 1;
+
+        let mut last_session = None;
+        let mut active_kind = None;
+        let mut minis_completed = 0_u32;
+        let mut longs_completed = 0_u32;
+        let mut long_cycle_started = 0_u64;
+        let mut rest_cycle_started = 0_u64;
+        for time in (0..=30_000).step_by(10) {
+            scheduler.handle_event(SchedulerEvent::Tick, clock(time));
+            let status = scheduler.status(clock(time));
+            if status.active_session == last_session {
+                continue;
+            }
+            match (active_kind.take(), status.break_kind) {
+                (None, Some(kind)) if status.active_session.is_some() => {
+                    match kind {
+                        BreakKind::Mini => {}
+                        BreakKind::Long => {
+                            assert!(
+                                time - long_cycle_started >= 2_500,
+                                "long break at {time} before its interval elapsed"
+                            );
+                            assert!(
+                                minis_completed >= 3,
+                                "long break at {time} after {minis_completed} minis"
+                            );
+                        }
+                        BreakKind::Rest => {
+                            assert!(
+                                time - rest_cycle_started >= 9_000,
+                                "rest break at {time} before its interval elapsed"
+                            );
+                            assert!(
+                                longs_completed >= 1,
+                                "rest break at {time} after {longs_completed} longs"
+                            );
+                        }
+                    }
+                    active_kind = Some(kind);
+                }
+                (Some(kind), _) => match kind {
+                    BreakKind::Mini => minis_completed += 1,
+                    BreakKind::Long => {
+                        minis_completed = 0;
+                        longs_completed += 1;
+                        long_cycle_started = time;
+                    }
+                    BreakKind::Rest => {
+                        minis_completed = 0;
+                        longs_completed = 0;
+                        long_cycle_started = time;
+                        rest_cycle_started = time;
+                    }
+                },
+                _ => {}
+            }
+            last_session = status.active_session;
+        }
+        assert!(longs_completed > 0 || rest_cycle_started > 0);
+    }
+
+    #[test]
     fn rest_defers_to_the_cadence_until_its_interval_elapses() {
         let scheduler = test_scheduler();
         let context = ScheduleContext {

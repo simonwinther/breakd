@@ -377,6 +377,35 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
         ],
     );
 
+    let align_cadence = gtk::Switch::builder()
+        .active(false)
+        .valign(gtk::Align::Center)
+        .build();
+    let cadence_preview_label = gtk::Label::new(None);
+    cadence_preview_label.set_halign(gtk::Align::Start);
+    cadence_preview_label.set_wrap(true);
+    cadence_preview_label.add_css_class("settings-description");
+    let cadence_group = settings_group(
+        "Cadence",
+        "How the three break tiers combine into one schedule.",
+        &[settings_row(
+            "Keep cadence aligned",
+            "Derive the long and rest minimum intervals from the mini cadence and thresholds.",
+            &align_cadence,
+        )],
+    );
+    cadence_group.append(&cadence_preview_label);
+    let cadence = CadenceControls {
+        align: align_cadence,
+        mini_interval: mini_interval.clone(),
+        long_interval: long_interval.clone(),
+        long_after_minis: long_after_minis.clone(),
+        rest_interval: rest_interval.clone(),
+        rest_after_longs: rest_after_longs.clone(),
+        preview: cadence_preview_label,
+    };
+    cadence.connect();
+
     let notifications_enabled = gtk::Switch::builder()
         .active(config.notifications.enabled)
         .valign(gtk::Align::Center)
@@ -423,7 +452,13 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
     );
 
     (
-        settings_page(&[mini_group, long_group, rest_group, notification_group]),
+        settings_page(&[
+            mini_group,
+            long_group,
+            rest_group,
+            cadence_group,
+            notification_group,
+        ]),
         (
             mini_interval,
             mini_duration,
@@ -953,6 +988,135 @@ fn parse_duration(entry: &gtk::Entry, field_name: &str) -> Result<DurationMs, St
         .map_err(|_| format!("{field_name} must be a duration such as 20s, 10m, or 1h 15m."))
 }
 
+#[derive(Clone)]
+struct CadenceControls {
+    align: gtk::Switch,
+    mini_interval: gtk::Entry,
+    long_interval: gtk::Entry,
+    long_after_minis: gtk::SpinButton,
+    rest_interval: gtk::Entry,
+    rest_after_longs: gtk::SpinButton,
+    preview: gtk::Label,
+}
+
+impl CadenceControls {
+    fn connect(&self) {
+        let controls = self.clone();
+        self.align.connect_active_notify(move |toggle| {
+            controls.long_interval.set_sensitive(!toggle.is_active());
+            controls.rest_interval.set_sensitive(!toggle.is_active());
+            controls.sync();
+        });
+        for entry in [
+            &self.mini_interval,
+            &self.long_interval,
+            &self.rest_interval,
+        ] {
+            let controls = self.clone();
+            entry.connect_changed(move |_| controls.sync());
+        }
+        for spin in [&self.long_after_minis, &self.rest_after_longs] {
+            let controls = self.clone();
+            spin.connect_value_changed(move |_| controls.sync());
+        }
+        self.sync();
+    }
+
+    fn sync(&self) {
+        if self.align.is_active() {
+            self.apply_alignment();
+        }
+        self.update_preview();
+    }
+
+    fn apply_alignment(&self) {
+        let Some(mini) = entry_millis(&self.mini_interval) else {
+            return;
+        };
+        let long = aligned_interval(mini, self.long_after_minis.value_as_int() as u32);
+        set_duration_text(&self.long_interval, long);
+        let rest = aligned_interval(long, self.rest_after_longs.value_as_int() as u32);
+        set_duration_text(&self.rest_interval, rest);
+    }
+
+    fn update_preview(&self) {
+        let cadence = entry_millis(&self.mini_interval).and_then(|mini| {
+            cadence_preview(
+                mini,
+                self.long_after_minis.value_as_int() as u32,
+                entry_millis(&self.long_interval)?,
+                self.rest_after_longs.value_as_int() as u32,
+                entry_millis(&self.rest_interval)?,
+            )
+        });
+        let text = match cadence {
+            Some(cadence) => format!(
+                "Long break about every {} (after {} mini breaks); \
+                 rest break about every {} (after {} long breaks).",
+                DurationMs::from_millis(cadence.long_every_ms),
+                cadence.minis_per_long,
+                DurationMs::from_millis(cadence.rest_every_ms),
+                cadence.longs_per_rest,
+            ),
+            None => "Enter valid intervals to preview the cadence.".into(),
+        };
+        self.preview.set_text(&text);
+    }
+}
+
+struct CadencePreview {
+    long_every_ms: u64,
+    minis_per_long: u64,
+    rest_every_ms: u64,
+    longs_per_rest: u64,
+}
+
+/// Approximate steady-state cadence, ignoring break durations: breaks start
+/// only on mini-interval boundaries, so a long break lands on the first
+/// boundary where its interval has elapsed and enough minis have completed,
+/// and a rest break on the first long-break boundary likewise.
+fn cadence_preview(
+    mini_ms: u64,
+    after_minis: u32,
+    long_ms: u64,
+    after_longs: u32,
+    rest_ms: u64,
+) -> Option<CadencePreview> {
+    if mini_ms == 0 {
+        return None;
+    }
+    let boundaries = u64::from(after_minis)
+        .saturating_add(1)
+        .max(long_ms.div_ceil(mini_ms));
+    let long_every_ms = mini_ms.checked_mul(boundaries)?;
+    let long_boundaries = u64::from(after_longs)
+        .saturating_add(1)
+        .max(rest_ms.div_ceil(long_every_ms));
+    let rest_every_ms = long_every_ms.checked_mul(long_boundaries)?;
+    Some(CadencePreview {
+        long_every_ms,
+        minis_per_long: boundaries - 1,
+        rest_every_ms,
+        longs_per_rest: long_boundaries - 1,
+    })
+}
+
+fn aligned_interval(base_ms: u64, threshold: u32) -> u64 {
+    base_ms.saturating_mul(u64::from(threshold).saturating_add(1))
+}
+
+fn entry_millis(entry: &gtk::Entry) -> Option<u64> {
+    let value: DurationMs = entry.text().trim().parse().ok()?;
+    (value.as_millis() > 0).then(|| value.as_millis())
+}
+
+fn set_duration_text(entry: &gtk::Entry, millis: u64) {
+    let text = DurationMs::from_millis(millis).to_string();
+    if entry.text() != text {
+        entry.set_text(&text);
+    }
+}
+
 fn save_and_reload(config: &AppConfig, restart_required: bool) -> Result<String, String> {
     breakd_config::save(config).map_err(|error| error.to_string())?;
     let executable = std::env::current_exe().map_err(|error| {
@@ -1132,6 +1296,39 @@ fn install_css() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cadence_preview_matches_the_boundary_model() {
+        // Aligned: 10m minis, long after 2 minis (30m), rest after 2 longs (1h 30m).
+        let cadence = cadence_preview(600_000, 2, 1_800_000, 2, 5_400_000).unwrap();
+        assert_eq!(cadence.long_every_ms, 1_800_000);
+        assert_eq!(cadence.minis_per_long, 2);
+        assert_eq!(cadence.rest_every_ms, 5_400_000);
+        assert_eq!(cadence.longs_per_rest, 2);
+
+        // Unaligned: the long and rest intervals dominate the thresholds.
+        let cadence = cadence_preview(600_000, 2, 3_600_000, 2, 7_200_000).unwrap();
+        assert_eq!(cadence.long_every_ms, 3_600_000);
+        assert_eq!(cadence.minis_per_long, 5);
+        assert_eq!(cadence.rest_every_ms, 10_800_000);
+        assert_eq!(cadence.longs_per_rest, 2);
+
+        // Unaligned the other way: the thresholds dominate the intervals.
+        let cadence = cadence_preview(600_000, 4, 1_200_000, 3, 600_000).unwrap();
+        assert_eq!(cadence.long_every_ms, 3_000_000);
+        assert_eq!(cadence.minis_per_long, 4);
+        assert_eq!(cadence.rest_every_ms, 12_000_000);
+        assert_eq!(cadence.longs_per_rest, 3);
+
+        assert!(cadence_preview(0, 2, 1, 2, 1).is_none());
+    }
+
+    #[test]
+    fn aligned_interval_multiplies_threshold_plus_one() {
+        assert_eq!(aligned_interval(600_000, 2), 1_800_000);
+        assert_eq!(aligned_interval(1_800_000, 2), 5_400_000);
+        assert_eq!(aligned_interval(u64::MAX, 2), u64::MAX);
+    }
 
     #[test]
     fn version_comparison() {
