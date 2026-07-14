@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/simonwinther/breakd/compare/v0.1.3...v0.1.4) (2026-07-14)
+
+
+### Features
+
+* **platform-linux:** add new sound assets and update README instructions ([efae215](https://github.com/simonwinther/breakd/commit/efae215a2fa6de84734b7f44312a8e2467c8b25a))
+
 ## [0.1.3](https://github.com/simonwinther/breakd/compare/v0.1.2...v0.1.3) (2026-07-13)
 
 
