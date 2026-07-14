@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/simonwinther/breakd/compare/v0.1.7...v0.1.8) (2026-07-14)
+
+
+### Features
+
+* **settings:** infer cadence alignment state ([06ed81d](https://github.com/simonwinther/breakd/commit/06ed81d92bf3f1e0c82bc582289f1a5fbfd6ea30))
+
 ## [0.1.7](https://github.com/simonwinther/breakd/compare/v0.1.6...v0.1.7) (2026-07-14)
 
 
