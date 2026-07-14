@@ -32,6 +32,8 @@ pub struct ActiveBreak {
     pub strict_until_boot_ms: u64,
     #[serde(default)]
     pub manual_resume: bool,
+    #[serde(default)]
+    pub completion_sound_emitted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +112,7 @@ pub enum Effect {
         summary: String,
         body: String,
     },
+    PlayCompletionSound,
     StartOverlay(OverlaySpec),
     StopOverlay {
         session_id: BreakSessionId,
@@ -425,9 +428,9 @@ impl Scheduler {
                 self.begin_scheduled_break(BreakKind::Long, context, now)
             }
             SchedulerState::MiniBreak { active } | SchedulerState::LongBreak { active }
-                if now.boottime_ms >= active.ends_boot_ms && !active.manual_resume =>
+                if now.boottime_ms >= active.ends_boot_ms =>
             {
-                self.finish_active(active, now)
+                self.expire_active(active, now)
             }
             SchedulerState::PausedUntil {
                 inner,
@@ -523,6 +526,7 @@ impl Scheduler {
             ends_boot_ms,
             strict_until_boot_ms,
             manual_resume: self.config.completion.manual_resume,
+            completion_sound_emitted: false,
         };
         let effect = Effect::StartOverlay(self.overlay_spec(&active, now));
         self.state = match kind {
@@ -532,7 +536,26 @@ impl Scheduler {
         vec![effect]
     }
 
+    fn expire_active(&mut self, mut active: ActiveBreak, now: ClockSample) -> Vec<Effect> {
+        if !active.manual_resume {
+            return self.finish_active(active, now);
+        }
+
+        let play_completion_sound = !active.completion_sound_emitted;
+        active.completion_sound_emitted = true;
+        self.state = match active.due.kind {
+            BreakKind::Mini => SchedulerState::MiniBreak { active },
+            BreakKind::Long => SchedulerState::LongBreak { active },
+        };
+        play_completion_sound
+            .then_some(Effect::PlayCompletionSound)
+            .into_iter()
+            .collect()
+    }
+
     fn finish_active(&mut self, active: ActiveBreak, now: ClockSample) -> Vec<Effect> {
+        let play_completion_sound =
+            now.boottime_ms >= active.ends_boot_ms && !active.completion_sound_emitted;
         let session_id = active.session_id;
         let mut context = active.context;
         match active.due.kind {
@@ -549,7 +572,12 @@ impl Scheduler {
             .monotonic_ms
             .saturating_add(self.config.schedule.mini.interval.as_millis());
         self.state = SchedulerState::Running { context };
-        vec![Effect::StopOverlay { session_id }]
+        let mut effects = Vec::with_capacity(2);
+        if play_completion_sound {
+            effects.push(Effect::PlayCompletionSound);
+        }
+        effects.push(Effect::StopOverlay { session_id });
+        effects
     }
 
     fn skip(&mut self, now: ClockSample) -> Result<Vec<Effect>, SchedulerError> {
@@ -732,7 +760,7 @@ impl Scheduler {
             return Vec::new();
         }
         let mut effects = self.tick(now);
-        if self.active_break().is_some() && effects.is_empty() {
+        if self.active_break().is_some() {
             effects.extend(self.startup_effects(now));
         }
         effects
@@ -989,9 +1017,11 @@ mod tests {
             Err(SchedulerError::NotAwaitingResume)
         );
 
+        let effects = scheduler.handle_event(SchedulerEvent::Tick, clock(100));
+        assert_eq!(effects, vec![Effect::PlayCompletionSound]);
         assert!(
             scheduler
-                .handle_event(SchedulerEvent::Tick, clock(100))
+                .handle_event(SchedulerEvent::Tick, clock(101))
                 .is_empty()
         );
         let status = scheduler.status(clock(100));
@@ -1018,9 +1048,11 @@ mod tests {
         scheduler.config.completion.manual_resume = true;
         scheduler.handle_command(&Command::Long, clock(0)).unwrap();
 
+        let effects = scheduler.handle_event(SchedulerEvent::Tick, clock(300));
+        assert_eq!(effects, vec![Effect::PlayCompletionSound]);
         assert!(
             scheduler
-                .handle_event(SchedulerEvent::Tick, clock(300))
+                .handle_event(SchedulerEvent::Tick, clock(301))
                 .is_empty()
         );
         assert!(scheduler.status(clock(300)).awaiting_resume);
@@ -1032,14 +1064,70 @@ mod tests {
     }
 
     #[test]
+    fn immediate_manual_resume_still_plays_the_completion_sound() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.completion.manual_resume = true;
+        scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+
+        let effects = scheduler
+            .handle_command(&Command::ResumeBreak, clock(100))
+            .unwrap();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::PlayCompletionSound, Effect::StopOverlay { .. }]
+        ));
+    }
+
+    #[test]
+    fn restored_manual_break_does_not_replay_the_completion_sound() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.completion.manual_resume = true;
+        scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+        assert_eq!(
+            scheduler.handle_event(SchedulerEvent::Tick, clock(100)),
+            vec![Effect::PlayCompletionSound]
+        );
+
+        let mut restored = Scheduler::restore(
+            scheduler.config.clone(),
+            "boot".into(),
+            clock(101),
+            "/tmp/breakd.sock".into(),
+            scheduler.snapshot(),
+        );
+        assert!(
+            restored
+                .handle_event(SchedulerEvent::Tick, clock(101))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn automatic_resume_remains_the_default() {
         let mut scheduler = test_scheduler();
         scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
 
         let effects = scheduler.handle_event(SchedulerEvent::Tick, clock(100));
-        assert!(matches!(effects.as_slice(), [Effect::StopOverlay { .. }]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::PlayCompletionSound, Effect::StopOverlay { .. }]
+        ));
         assert!(!scheduler.status(clock(100)).awaiting_resume);
         assert!(matches!(scheduler.state(), SchedulerState::Running { .. }));
+    }
+
+    #[test]
+    fn dismissing_a_break_early_does_not_play_the_completion_sound() {
+        let mut scheduler = test_scheduler();
+        scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+
+        let effects = scheduler.handle_command(&Command::Skip, clock(20)).unwrap();
+        assert!(matches!(effects.as_slice(), [Effect::StopOverlay { .. }]));
+        assert!(
+            scheduler
+                .handle_event(SchedulerEvent::Tick, clock(100))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1067,7 +1155,7 @@ mod tests {
         scheduler.handle_event(SchedulerEvent::LockStarted, clock(10));
 
         let effects = scheduler.handle_event(SchedulerEvent::LockEnded, clock(600));
-        let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+        let [Effect::PlayCompletionSound, Effect::StartOverlay(spec)] = effects.as_slice() else {
             panic!("expected the manual-resume overlay to be restored");
         };
         assert!(spec.manual_resume);

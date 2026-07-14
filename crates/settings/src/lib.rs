@@ -1,6 +1,8 @@
 use std::{cell::RefCell, process::Command, rc::Rc};
 
-use breakd_core::{AppConfig, ContentSelector, DisplayMode, DurationMs, PointerMode, StrictMode};
+use breakd_core::{
+    AppConfig, CompletionSound, ContentSelector, DisplayMode, DurationMs, PointerMode, StrictMode,
+};
 use gtk::{gio, prelude::*};
 use gtk4 as gtk;
 
@@ -54,6 +56,7 @@ struct SettingsWidgets {
     allow_postpone_during_lockout: gtk::Switch,
     inhibit_shortcuts: gtk::Switch,
     manual_resume: gtk::Switch,
+    completion_sound: gtk::DropDown,
     display_mode: gtk::DropDown,
     content_selector: gtk::DropDown,
     opacity: gtk::Scale,
@@ -106,6 +109,7 @@ impl SettingsWidgets {
             self.allow_postpone_during_lockout.is_active();
         config.strict.inhibit_shortcuts = self.inhibit_shortcuts.is_active();
         config.completion.manual_resume = self.manual_resume.is_active();
+        config.completion.sound = completion_sound_from_index(self.completion_sound.selected());
 
         config.display.mode = display_mode_from_index(self.display_mode.selected());
         config.display.content_selector =
@@ -150,6 +154,7 @@ fn build_window(
         allow_postpone_during_lockout: action_widgets.6,
         inhibit_shortcuts: action_widgets.7,
         manual_resume: action_widgets.8,
+        completion_sound: action_widgets.9,
         display_mode: desktop_widgets.0,
         content_selector: desktop_widgets.1,
         opacity: desktop_widgets.2,
@@ -377,6 +382,7 @@ type ActionPageWidgets = (
     gtk::Switch,
     gtk::Switch,
     gtk::Switch,
+    gtk::DropDown,
 );
 
 fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) {
@@ -463,14 +469,24 @@ fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) 
         .active(config.completion.manual_resume)
         .valign(gtk::Align::Center)
         .build();
+    let completion_sound =
+        gtk::DropDown::from_strings(&["Warm rise", "Soft bloom", "Deep halo", "Clean chime"]);
+    completion_sound.set_selected(completion_sound_index(config.completion.sound));
     let completion_group = settings_group(
         "Break completion",
-        "Choose when a completed break returns to the work timer.",
-        &[settings_row(
-            "Manual resume",
-            "Wait at zero until you press a key or click the overlay.",
-            &manual_resume,
-        )],
+        "Choose what happens when a break reaches zero.",
+        &[
+            settings_row(
+                "Completion sound",
+                "Sound played when the countdown reaches zero.",
+                &completion_sound,
+            ),
+            settings_row(
+                "Manual resume",
+                "Wait at zero until you press a key or click the overlay.",
+                &manual_resume,
+            ),
+        ],
     );
 
     (
@@ -485,6 +501,7 @@ fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) 
             allow_postpone_during_lockout,
             inhibit_shortcuts,
             manual_resume,
+            completion_sound,
         ),
     )
 }
@@ -832,6 +849,24 @@ fn strict_mode_from_index(value: u32) -> StrictMode {
     }
 }
 
+fn completion_sound_index(value: CompletionSound) -> u32 {
+    match value {
+        CompletionSound::WarmRise => 0,
+        CompletionSound::SoftBloom => 1,
+        CompletionSound::DeepHalo => 2,
+        CompletionSound::CleanChime => 3,
+    }
+}
+
+fn completion_sound_from_index(value: u32) -> CompletionSound {
+    match value {
+        1 => CompletionSound::SoftBloom,
+        2 => CompletionSound::DeepHalo,
+        3 => CompletionSound::CleanChime,
+        _ => CompletionSound::WarmRise,
+    }
+}
+
 fn display_mode_index(value: DisplayMode) -> u32 {
     match value {
         DisplayMode::All => 0,
@@ -952,6 +987,17 @@ mod tests {
         }
         for value in [StrictMode::Off, StrictMode::Delay, StrictMode::Entire] {
             assert_eq!(strict_mode_from_index(strict_mode_index(value)), value);
+        }
+        for value in [
+            CompletionSound::WarmRise,
+            CompletionSound::SoftBloom,
+            CompletionSound::DeepHalo,
+            CompletionSound::CleanChime,
+        ] {
+            assert_eq!(
+                completion_sound_from_index(completion_sound_index(value)),
+                value
+            );
         }
     }
 }

@@ -43,7 +43,7 @@ pkgdesc='Wayland-native break reminder with multi-monitor overlays'
 arch=('x86_64')
 url='$repo_url'
 license=('MIT' 'BSD-2-Clause')
-depends=('cairo' 'glib2' 'glibc' 'graphene' 'gtk4' 'gtk4-layer-shell')
+depends=('cairo' 'glib2' 'glibc' 'graphene' 'gtk4' 'gtk4-layer-shell' 'libcanberra')
 makedepends=('cargo' 'pkgconf')
 options=('!debug')
 source=("$archive_name::$repo_url/releases/download/$release_tag/$archive_name")
@@ -77,6 +77,8 @@ check() {
 package() {
   cd "\$pkgname-\$pkgver"
   install -Dm755 "\$srcdir/target/release/breakd" "\$pkgdir/usr/bin/breakd"
+  install -dm755 "\$pkgdir/usr/share/breakd"
+  install -m644 crates/platform-linux/assets/*.oga "\$pkgdir/usr/share/breakd/"
   install -Dm644 packaging/systemd/breakd.service \
     "\$pkgdir/usr/lib/systemd/user/breakd.service"
   install -Dm644 packaging/io.github.simonwinther.breakd.settings.desktop \

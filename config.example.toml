@@ -11,6 +11,7 @@ after_minis = 2
 
 [completion]
 manual_resume = false
+sound = "warm-rise" # warm-rise | soft-bloom | deep-halo | clean-chime
 
 [notifications]
 enabled = true

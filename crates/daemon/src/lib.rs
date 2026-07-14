@@ -1,11 +1,15 @@
-use std::{collections::VecDeque, path::Path, process::Stdio};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use anyhow::{Context, Result};
-use breakd_core::{BreakSessionId, Command, OverlaySpec, Response};
+use breakd_core::{BreakSessionId, Command, CompletionSound, OverlaySpec, Response};
 use breakd_ipc::{IPC_VERSION, IncomingRequest, Server};
 use breakd_platform_linux::{
-    HyprlandClient, IdleCapability, IdleEvent, LinuxClock, NotificationClient, PowerEvent,
-    StateStore, probe_wayland_globals, spawn_idle_monitor, spawn_logind_monitor,
+    EventSoundClient, HyprlandClient, IdleCapability, IdleEvent, LinuxClock, NotificationClient,
+    PowerEvent, StateStore, probe_wayland_globals, spawn_idle_monitor, spawn_logind_monitor,
 };
 use breakd_scheduler::{Effect, Scheduler, SchedulerEvent, SchedulerStatus};
 use breakd_tray::{TrayAction, TrayController, TrayState};
@@ -78,8 +82,22 @@ pub async fn run() -> Result<()> {
     tracing::info!(?idle_capability, "idle capability detected");
 
     let notifications = NotificationClient::new(instance.name());
+    let event_sounds = match EventSoundClient::new(&completion_sound_directory(instance)) {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::warn!(%error, "event sound integration unavailable");
+            None
+        }
+    };
     let mut overlay = OverlaySupervisor::default();
-    apply_effects(scheduler.startup_effects(now), &mut overlay, &notifications).await;
+    apply_effects(
+        scheduler.startup_effects(now),
+        &mut overlay,
+        &notifications,
+        event_sounds.as_ref(),
+        config.completion.sound,
+    )
+    .await;
 
     let (tray_sender, mut tray_receiver) = mpsc::unbounded_channel();
     let mut tray = TrayController::new(tray_sender, instance.name());
@@ -109,7 +127,13 @@ pub async fn run() -> Result<()> {
                 let previous = scheduler.state().clone();
                 let effects = scheduler.handle_event(SchedulerEvent::Tick, now);
                 persist_if_changed(&state_store, &scheduler, &previous)?;
-                apply_effects(effects, &mut overlay, &notifications).await;
+                apply_effects(
+                    effects,
+                    &mut overlay,
+                    &notifications,
+                    event_sounds.as_ref(),
+                    config.completion.sound,
+                ).await;
                 if let Some((session_id, reason)) = overlay.poll_exit().await? {
                     let status = scheduler.status(now);
                     if status.active_session == Some(session_id)
@@ -122,7 +146,13 @@ pub async fn run() -> Result<()> {
                             now,
                         );
                         persist_if_changed(&state_store, &scheduler, &previous)?;
-                        apply_effects(effects, &mut overlay, &notifications).await;
+                        apply_effects(
+                            effects,
+                            &mut overlay,
+                            &notifications,
+                            event_sounds.as_ref(),
+                            config.completion.sound,
+                        ).await;
                     }
                 }
             }
@@ -139,6 +169,7 @@ pub async fn run() -> Result<()> {
                     &mut config,
                     &mut overlay,
                     &notifications,
+                    event_sounds.as_ref(),
                     idle_capability,
                     tray.available(),
                 ).await;
@@ -159,6 +190,7 @@ pub async fn run() -> Result<()> {
                             &mut config,
                             &mut overlay,
                             &notifications,
+                            event_sounds.as_ref(),
                             idle_capability,
                             tray.available(),
                         ).await {
@@ -184,7 +216,13 @@ pub async fn run() -> Result<()> {
                 let previous = scheduler.state().clone();
                 let effects = scheduler.handle_event(scheduler_event, now);
                 persist_if_changed(&state_store, &scheduler, &previous)?;
-                apply_effects(effects, &mut overlay, &notifications).await;
+                apply_effects(
+                    effects,
+                    &mut overlay,
+                    &notifications,
+                    event_sounds.as_ref(),
+                    config.completion.sound,
+                ).await;
             }
             Some(event) = idle_receiver.recv() => {
                 let now = clock.sample()?;
@@ -195,7 +233,13 @@ pub async fn run() -> Result<()> {
                 let previous = scheduler.state().clone();
                 let effects = scheduler.handle_event(scheduler_event, now);
                 persist_if_changed(&state_store, &scheduler, &previous)?;
-                apply_effects(effects, &mut overlay, &notifications).await;
+                apply_effects(
+                    effects,
+                    &mut overlay,
+                    &notifications,
+                    event_sounds.as_ref(),
+                    config.completion.sound,
+                ).await;
             }
             result = tokio::signal::ctrl_c() => {
                 result?;
@@ -225,6 +269,15 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+fn completion_sound_directory(instance: breakd_config::RuntimeInstance) -> PathBuf {
+    match instance {
+        breakd_config::RuntimeInstance::Production => PathBuf::from("/usr/share/breakd"),
+        breakd_config::RuntimeInstance::Development => {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../platform-linux/assets")
+        }
+    }
+}
+
 async fn spawn_settings() -> Result<()> {
     let executable = std::env::current_exe().context("resolve breakd executable")?;
     let mut child = TokioCommand::new(executable)
@@ -251,6 +304,7 @@ async fn handle_request(
     config: &mut breakd_core::AppConfig,
     overlay: &mut OverlaySupervisor,
     notifications: &NotificationClient,
+    event_sounds: Option<&EventSoundClient>,
     idle_capability: IdleCapability,
     tray_available: bool,
 ) -> Response {
@@ -263,6 +317,7 @@ async fn handle_request(
         config,
         overlay,
         notifications,
+        event_sounds,
         idle_capability,
         tray_available,
     )
@@ -295,6 +350,7 @@ async fn execute_command(
     config: &mut breakd_core::AppConfig,
     overlay: &mut OverlaySupervisor,
     notifications: &NotificationClient,
+    event_sounds: Option<&EventSoundClient>,
     idle_capability: IdleCapability,
     tray_available: bool,
 ) -> Result<(String, Option<serde_json::Value>)> {
@@ -379,7 +435,14 @@ async fn execute_command(
                 .handle_command(command, now)
                 .map_err(anyhow::Error::from)?;
             persist_if_changed(state_store, scheduler, &previous)?;
-            apply_effects(effects, overlay, notifications).await;
+            apply_effects(
+                effects,
+                overlay,
+                notifications,
+                event_sounds,
+                config.completion.sound,
+            )
+            .await;
             Ok((
                 command_message(command).into(),
                 Some(serde_json::to_value(scheduler.status(now))?),
@@ -541,6 +604,8 @@ async fn apply_effects(
     effects: Vec<Effect>,
     overlay: &mut OverlaySupervisor,
     notifications: &NotificationClient,
+    event_sounds: Option<&EventSoundClient>,
+    completion_sound: CompletionSound,
 ) {
     for effect in effects {
         match effect {
@@ -551,6 +616,13 @@ async fn apply_effects(
                         tracing::warn!(%error, "desktop notification failed");
                     }
                 });
+            }
+            Effect::PlayCompletionSound => {
+                if let Some(event_sounds) = event_sounds
+                    && let Err(error) = event_sounds.play_completion(completion_sound)
+                {
+                    tracing::warn!(%error, "completion sound failed");
+                }
             }
             Effect::StartOverlay(spec) => {
                 if let Err(error) = overlay.start(spec).await {

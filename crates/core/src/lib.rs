@@ -163,9 +163,21 @@ pub struct ScheduleConfig {
     pub long: LongBreakTiming,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompletionSound {
+    #[default]
+    WarmRise,
+    SoftBloom,
+    DeepHalo,
+    CleanChime,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionConfig {
     pub manual_resume: bool,
+    #[serde(default)]
+    pub sound: CompletionSound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

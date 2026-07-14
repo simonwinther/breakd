@@ -62,7 +62,7 @@ jobs:
             archlinux:base-devel bash -lc '
               set -euo pipefail
               pacman -Syu --noconfirm --needed \
-                cairo git glib2 graphene gtk4 gtk4-layer-shell namcap pkgconf rust wayland
+                cairo git glib2 graphene gtk4 gtk4-layer-shell libcanberra namcap pkgconf rust wayland
               getent group "$HOST_GID" >/dev/null || groupadd -g "$HOST_GID" builder
               useradd -m -u "$HOST_UID" -g "$HOST_GID" builder
               chown -R "$HOST_UID:$HOST_GID" /workspace

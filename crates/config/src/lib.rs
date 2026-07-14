@@ -6,11 +6,11 @@ use std::{
 };
 
 use breakd_core::{
-    AppConfig, BreakTiming, CompletionConfig, ContentConfig, ContentSelector, DisplayConfig,
-    DisplayMode, DurationMs, FullscreenBehavior, FullscreenConfig, HyprlandConfig, IdleConfig,
-    KeyboardMode, Layer, LoggingConfig, LongBreakTiming, MissedBreakPolicy, NotificationsConfig,
-    PointerMode, PostponeConfig, PostponeRule, RecoveryConfig, ScheduleConfig, SkipConfig,
-    SkipRule, StartupConfig, StrictConfig, StrictMode, TrayConfig,
+    AppConfig, BreakTiming, CompletionConfig, CompletionSound, ContentConfig, ContentSelector,
+    DisplayConfig, DisplayMode, DurationMs, FullscreenBehavior, FullscreenConfig, HyprlandConfig,
+    IdleConfig, KeyboardMode, Layer, LoggingConfig, LongBreakTiming, MissedBreakPolicy,
+    NotificationsConfig, PointerMode, PostponeConfig, PostponeRule, RecoveryConfig, ScheduleConfig,
+    SkipConfig, SkipRule, StartupConfig, StrictConfig, StrictMode, TrayConfig,
 };
 use nix::unistd::Uid;
 use thiserror::Error;
@@ -110,6 +110,7 @@ pub fn defaults() -> AppConfig {
         },
         completion: CompletionConfig {
             manual_resume: false,
+            sound: CompletionSound::WarmRise,
         },
         notifications: NotificationsConfig {
             enabled: true,
@@ -520,7 +521,18 @@ mod tests {
         assert!(!decoded.strict.inhibit_shortcuts);
         assert!(!decoded.hyprland.submap_fallback);
         assert!(!decoded.completion.manual_resume);
+        assert_eq!(decoded.completion.sound, CompletionSound::WarmRise);
         assert!(decoded.tray.enabled);
+    }
+
+    #[test]
+    fn old_completion_config_uses_the_default_sound() {
+        let mut value: toml::Value = toml::from_str(&example_toml()).unwrap();
+        value["completion"].as_table_mut().unwrap().remove("sound");
+
+        let source = toml::to_string(&value).unwrap();
+        let decoded: AppConfig = toml::from_str(&source).unwrap();
+        assert_eq!(decoded.completion.sound, CompletionSound::WarmRise);
     }
 
     #[test]

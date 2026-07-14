@@ -19,7 +19,7 @@ jobs:
       - name: Install dependencies
         run: >-
           pacman -Syu --noconfirm --needed
-          git gtk4 gtk4-layer-shell pkgconf rust wayland
+          git gtk4 gtk4-layer-shell libcanberra pkgconf rust wayland
 
       - name: Check formatting
         run: cargo fmt --all --check

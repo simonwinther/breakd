@@ -91,11 +91,15 @@ that confirmation. The setting applies to both mini and long breaks:
 ```toml
 [completion]
 manual_resume = true
+sound = "warm-rise"
 ```
 
-You can also enable it under Actions in `breakd settings`. While the overlay is
-waiting at zero, it captures the confirmation even when normal pointer input is
-set to `controls` or `none`.
+The bundled sound choices are `warm-rise`, `soft-bloom`, `deep-halo`, and
+`clean-chime`. You can select the sound and enable manual resume under Actions in
+`breakd settings`. While the overlay is waiting at zero, it captures the
+confirmation even when normal pointer input is set to `controls` or `none`. The
+selected sound plays when the countdown reaches zero with either manual or
+automatic resume.
 
 ### Tray
 
