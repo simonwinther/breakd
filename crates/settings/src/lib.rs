@@ -382,7 +382,7 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
     );
 
     let align_cadence = gtk::Switch::builder()
-        .active(false)
+        .active(cadence_is_aligned(&config.schedule))
         .valign(gtk::Align::Center)
         .build();
     let cadence_preview_label = gtk::Label::new(None);
@@ -1011,9 +1011,8 @@ struct CadenceControls {
 impl CadenceControls {
     fn connect(&self) {
         let controls = self.clone();
-        self.align.connect_active_notify(move |toggle| {
-            controls.long_interval.set_sensitive(!toggle.is_active());
-            controls.rest_interval.set_sensitive(!toggle.is_active());
+        self.align.connect_active_notify(move |_| {
+            controls.apply_sensitivity();
             controls.sync();
         });
         for entry in [
@@ -1028,7 +1027,14 @@ impl CadenceControls {
             let controls = self.clone();
             spin.connect_value_changed(move |_| controls.sync());
         }
+        self.apply_sensitivity();
         self.sync();
+    }
+
+    fn apply_sensitivity(&self) {
+        let editable = !self.align.is_active();
+        self.long_interval.set_sensitive(editable);
+        self.rest_interval.set_sensitive(editable);
     }
 
     fn sync(&self) {
@@ -1112,6 +1118,15 @@ fn cadence_preview(
         rest_every_ms,
         longs_per_rest: long_boundaries - 1,
     })
+}
+
+/// The alignment switch is not stored anywhere; it reflects whether the
+/// saved intervals already match the values alignment would derive.
+fn cadence_is_aligned(schedule: &breakd_core::ScheduleConfig) -> bool {
+    let mini = schedule.mini.interval.as_millis();
+    let long = schedule.long.interval.as_millis();
+    long == aligned_interval(mini, schedule.long.after_minis)
+        && schedule.rest.interval.as_millis() == aligned_interval(long, schedule.rest.after_longs)
 }
 
 fn aligned_interval(base_ms: u64, threshold: u32) -> u64 {
@@ -1383,6 +1398,19 @@ mod tests {
         assert_eq!(cadence.longs_per_rest, 3);
 
         assert!(cadence_preview(0, 2, 1, 2, 1).is_none());
+    }
+
+    #[test]
+    fn cadence_alignment_is_inferred_from_saved_values() {
+        let mut config = breakd_config::defaults();
+        // Defaults are unaligned: rest is 2h, aligned would be 3 x 30m.
+        assert!(!cadence_is_aligned(&config.schedule));
+
+        config.schedule.rest.interval = DurationMs::from_millis(3 * 30 * 60 * 1_000);
+        assert!(cadence_is_aligned(&config.schedule));
+
+        config.schedule.long.interval = DurationMs::from_millis(45 * 60 * 1_000);
+        assert!(!cadence_is_aligned(&config.schedule));
     }
 
     #[test]
