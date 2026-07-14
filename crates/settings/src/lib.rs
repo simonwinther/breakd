@@ -6,6 +6,9 @@ use breakd_core::{
 use gtk::{gio, prelude::*};
 use gtk4 as gtk;
 
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const RELEASES_URL: &str = "https://github.com/simonwinther/breakd/releases/latest";
+
 pub fn run() -> Result<(), String> {
     let instance = breakd_config::RuntimeInstance::current();
     let initial = breakd_config::load().map_err(|error| error.to_string())?;
@@ -230,6 +233,7 @@ fn build_window(
     let status_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     status_bar.add_css_class("settings-status-bar");
     status_bar.append(&status);
+    status_bar.append(&version_corner());
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.append(&introduction);
@@ -733,6 +737,67 @@ fn desktop_page(config: &AppConfig) -> (gtk::ScrolledWindow, DesktopPageWidgets)
     )
 }
 
+fn version_corner() -> gtk::Box {
+    let corner = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    corner.set_halign(gtk::Align::End);
+    let update_link = gtk::LinkButton::with_label(RELEASES_URL, "");
+    update_link.set_visible(false);
+    update_link.set_valign(gtk::Align::Center);
+    update_link.add_css_class("settings-update-link");
+    let version = gtk::Label::new(Some(&format!("v{CURRENT_VERSION}")));
+    version.add_css_class("settings-status");
+    corner.append(&update_link);
+    corner.append(&version);
+
+    let update_link = update_link.clone();
+    glib::spawn_future_local(async move {
+        let Ok(Some(tag)) = gio::spawn_blocking(fetch_latest_release_tag).await else {
+            return;
+        };
+        if is_newer_version(&tag, CURRENT_VERSION) {
+            update_link.set_label(&format!("{tag} available"));
+            update_link.set_visible(true);
+        }
+    });
+    corner
+}
+
+fn fetch_latest_release_tag() -> Option<String> {
+    let output = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "5",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            RELEASES_URL,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let final_url = String::from_utf8(output.stdout).ok()?;
+    let tag = final_url.trim().rsplit_once("/tag/")?.1;
+    (!tag.is_empty()).then(|| tag.to_string())
+}
+
+fn is_newer_version(remote_tag: &str, current: &str) -> bool {
+    let remote = parse_version(remote_tag.trim_start_matches('v'));
+    let current = parse_version(current);
+    matches!((remote, current), (Some(remote), Some(current)) if remote > current)
+}
+
+fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((major, minor, patch))
+}
+
 fn postpone_controls(rule: &breakd_core::PostponeRule) -> (PostponeWidgets, Vec<gtk::Box>) {
     let enabled = gtk::Switch::builder()
         .active(rule.enabled)
@@ -1049,6 +1114,10 @@ fn install_css() {
             color: @error_color;
             opacity: 1;
         }
+        .settings-update-link {
+            padding: 0;
+            min-height: 0;
+        }
         "#,
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -1063,6 +1132,17 @@ fn install_css() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_comparison() {
+        assert!(is_newer_version("v0.2.0", "0.1.5"));
+        assert!(is_newer_version("0.1.6", "0.1.5"));
+        assert!(is_newer_version("v1.0.0", "0.9.9"));
+        assert!(!is_newer_version("v0.1.5", "0.1.5"));
+        assert!(!is_newer_version("v0.1.4", "0.1.5"));
+        assert!(!is_newer_version("not-a-tag", "0.1.5"));
+        assert!(!is_newer_version("v0.2", "0.1.5"));
+    }
 
     #[test]
     fn selector_indexes_round_trip() {
