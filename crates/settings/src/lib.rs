@@ -1,4 +1,8 @@
-use std::{cell::RefCell, process::Command, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    process::Command,
+    rc::Rc,
+};
 
 use breakd_core::{
     AppConfig, CompletionSound, ContentSelector, DisplayMode, DurationMs, PointerMode, StrictMode,
@@ -403,6 +407,7 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
         rest_interval: rest_interval.clone(),
         rest_after_longs: rest_after_longs.clone(),
         preview: cadence_preview_label,
+        syncing: Rc::new(Cell::new(false)),
     };
     cadence.connect();
 
@@ -997,6 +1002,10 @@ struct CadenceControls {
     rest_interval: gtk::Entry,
     rest_after_longs: gtk::SpinButton,
     preview: gtk::Label,
+    // Suppresses re-entrant sync() calls: writing a derived interval fires
+    // that entry's "changed" signal, including mid-edit while its text is
+    // in a partially updated state.
+    syncing: Rc<Cell<bool>>,
 }
 
 impl CadenceControls {
@@ -1023,10 +1032,14 @@ impl CadenceControls {
     }
 
     fn sync(&self) {
+        if self.syncing.replace(true) {
+            return;
+        }
         if self.align.is_active() {
             self.apply_alignment();
         }
         self.update_preview();
+        self.syncing.set(false);
     }
 
     fn apply_alignment(&self) {
@@ -1296,6 +1309,55 @@ fn install_css() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a display server"]
+    fn cadence_alignment_survives_toggling_and_edits() {
+        gtk::init().unwrap();
+        let config = breakd_config::defaults();
+        let mini_interval = duration_entry(config.schedule.mini.interval);
+        let long_interval = duration_entry(config.schedule.long.interval);
+        let rest_interval = duration_entry(config.schedule.rest.interval);
+        let long_after_minis = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+        long_after_minis.set_value(f64::from(config.schedule.long.after_minis));
+        let rest_after_longs = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+        rest_after_longs.set_value(f64::from(config.schedule.rest.after_longs));
+        let align = gtk::Switch::new();
+        let preview = gtk::Label::new(None);
+        let controls = CadenceControls {
+            align: align.clone(),
+            mini_interval: mini_interval.clone(),
+            long_interval: long_interval.clone(),
+            long_after_minis: long_after_minis.clone(),
+            rest_interval: rest_interval.clone(),
+            rest_after_longs: rest_after_longs.clone(),
+            preview: preview.clone(),
+            syncing: Rc::new(Cell::new(false)),
+        };
+        controls.connect();
+
+        align.set_active(true);
+        assert_eq!(long_interval.text(), "30m");
+        assert_eq!(rest_interval.text(), "1h 30m");
+        assert!(!long_interval.is_sensitive());
+        assert!(!rest_interval.is_sensitive());
+
+        mini_interval.set_text("15m");
+        assert_eq!(long_interval.text(), "45m");
+        assert_eq!(rest_interval.text(), "2h 15m");
+        long_after_minis.set_value(3.0);
+        assert_eq!(long_interval.text(), "1h");
+        assert_eq!(rest_interval.text(), "3h");
+        rest_after_longs.set_value(1.0);
+        assert_eq!(rest_interval.text(), "2h");
+        assert!(preview.text().starts_with("Long break about every 1h"));
+
+        align.set_active(false);
+        assert!(long_interval.is_sensitive());
+        assert!(rest_interval.is_sensitive());
+        long_interval.set_text("2h");
+        assert_eq!(long_interval.text(), "2h");
+    }
 
     #[test]
     fn cadence_preview_matches_the_boundary_model() {
