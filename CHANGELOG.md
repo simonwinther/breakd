@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/simonwinther/breakd/compare/v0.1.4...v0.1.5) (2026-07-14)
+
+
+### Features
+
+* **docs:** update README with new break scheduling details and options ([a96e7a6](https://github.com/simonwinther/breakd/commit/a96e7a6238d0a207450923be4a13b5bc2f5a15b7))
+
 ## [0.1.4](https://github.com/simonwinther/breakd/compare/v0.1.3...v0.1.4) (2026-07-14)
 
 
