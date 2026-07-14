@@ -506,7 +506,10 @@ impl HyprlandShortcutGuard {
 
     async fn reconcile(&mut self, config: &breakd_core::AppConfig, status: &SchedulerStatus) {
         let should_block = submap_fallback_enabled(config)
-            && matches!(status.state.as_str(), "mini-break" | "long-break");
+            && matches!(
+                status.state.as_str(),
+                "mini-break" | "long-break" | "rest-break"
+            );
         if !should_block {
             if self.blocking {
                 self.release().await;
@@ -706,6 +709,7 @@ fn command_message(command: &Command) -> &'static str {
         Command::Postpone => "break postponed",
         Command::Mini => "mini break started",
         Command::Long => "long break started",
+        Command::Rest => "rest break started",
         Command::Toggle => "schedule toggled",
         Command::Status | Command::Reload | Command::Outputs | Command::Doctor => "ok",
     }

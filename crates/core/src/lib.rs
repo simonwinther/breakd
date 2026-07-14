@@ -82,6 +82,7 @@ impl<'de> Deserialize<'de> for DurationMs {
 pub enum BreakKind {
     Mini,
     Long,
+    Rest,
 }
 
 impl fmt::Display for BreakKind {
@@ -89,6 +90,7 @@ impl fmt::Display for BreakKind {
         match self {
             Self::Mini => formatter.write_str("mini"),
             Self::Long => formatter.write_str("long"),
+            Self::Rest => formatter.write_str("rest"),
         }
     }
 }
@@ -158,9 +160,28 @@ pub struct LongBreakTiming {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestBreakTiming {
+    pub interval: DurationMs,
+    pub duration: DurationMs,
+    pub after_longs: u32,
+}
+
+impl Default for RestBreakTiming {
+    fn default() -> Self {
+        Self {
+            interval: DurationMs::from_millis(2 * 60 * 60 * 1_000),
+            duration: DurationMs::from_millis(30 * 60 * 1_000),
+            after_longs: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleConfig {
     pub mini: BreakTiming,
     pub long: LongBreakTiming,
+    #[serde(default)]
+    pub rest: RestBreakTiming,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +206,8 @@ pub struct NotificationsConfig {
     pub enabled: bool,
     pub mini_lead: DurationMs,
     pub long_lead: DurationMs,
+    #[serde(default = "default_rest_lead")]
+    pub rest_lead: DurationMs,
     pub actions: bool,
 }
 
@@ -201,6 +224,8 @@ pub struct PostponeRule {
 pub struct PostponeConfig {
     pub mini: PostponeRule,
     pub long: PostponeRule,
+    #[serde(default = "default_rest_postpone")]
+    pub rest: PostponeRule,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +243,8 @@ impl Default for SkipRule {
 pub struct SkipConfig {
     pub mini: SkipRule,
     pub long: SkipRule,
+    #[serde(default)]
+    pub rest: SkipRule,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +370,18 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_rest_lead() -> DurationMs {
+    DurationMs::from_millis(60 * 1_000)
+}
+
+fn default_rest_postpone() -> PostponeRule {
+    PostponeRule {
+        enabled: true,
+        duration: DurationMs::from_millis(10 * 60 * 1_000),
+        max_postponements: None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClockSample {
     pub monotonic_ms: u64,
@@ -450,6 +489,7 @@ pub enum Command {
     Postpone,
     Mini,
     Long,
+    Rest,
     Toggle,
     Reload,
     Outputs,

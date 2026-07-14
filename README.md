@@ -39,7 +39,7 @@ $EDITOR ~/.config/breakd/config.toml
 breakd reload
 ```
 
-The default schedule is a 20-second mini break every 10 minutes and a 5-minute long break every 30 minutes. Durations accept values such as `20s`, `7m 30s`, `1h`, and `1h 15m`.
+The default schedule is a 20-second mini break every 10 minutes, a 5-minute long break every 30 minutes after 2 completed mini breaks, and a 30-minute rest break every 2 hours after 2 completed long breaks. Durations accept values such as `20s`, `7m 30s`, `1h`, and `1h 15m`.
 
 Most changes take effect after `breakd reload`. Restart the service after changing `[idle]` or `[logging]`:
 
@@ -61,13 +61,16 @@ This blocks normal Hyprland bindings, including the `SUPER+1..9` workspace bindi
 
 ### Skip and postponement
 
-Mini and long breaks have independent skip and postponement settings:
+Mini, long, and rest breaks have independent skip and postponement settings:
 
 ```toml
 [skip.mini]
 enabled = false
 
 [skip.long]
+enabled = true
+
+[skip.rest]
 enabled = true
 
 [postpone.mini]
@@ -78,15 +81,19 @@ duration = "2m"
 enabled = true
 duration = "10m"
 max_postponements = 2
+
+[postpone.rest]
+enabled = true
+duration = "10m"
 ```
 
-`max_postponements` counts postponements within one break cycle. Omit it for unlimited postponements, which is the default. When an action is disabled or its limit has been reached, its button is omitted and its CLI command returns an error. Disabling skip also prevents pause, reset, or toggle from dismissing an active break early. Mini and long policies do not affect each other.
+`max_postponements` counts postponements within one break cycle. Omit it for unlimited postponements, which is the default. When an action is disabled or its limit has been reached, its button is omitted and its CLI command returns an error. Disabling skip also prevents pause, reset, or toggle from dismissing an active break early. The policies for each break kind do not affect each other.
 
 ### Manual resume
 
 Manual resume keeps the overlay open after the countdown reaches zero. Press any
 key or click the overlay when you return, and the next work interval starts from
-that confirmation. The setting applies to both mini and long breaks:
+that confirmation. The setting applies to every break kind:
 
 ```toml
 [completion]
@@ -165,6 +172,7 @@ breakd skip
 breakd postpone
 breakd mini
 breakd long
+breakd rest
 breakd toggle
 breakd reload
 breakd outputs [--json]
@@ -186,6 +194,7 @@ hl.bind("SUPER + SHIFT + S", hl.dsp.exec_cmd("breakd skip"), breakd_flags)
 hl.bind("SUPER + SHIFT + P", hl.dsp.exec_cmd("breakd postpone"), breakd_flags)
 hl.bind("SUPER + SHIFT + M", hl.dsp.exec_cmd("breakd mini"), breakd_flags)
 hl.bind("SUPER + SHIFT + L", hl.dsp.exec_cmd("breakd long"), breakd_flags)
+hl.bind("SUPER + SHIFT + R", hl.dsp.exec_cmd("breakd rest"), breakd_flags)
 ```
 
 An optional layer rule disables overlay animations:

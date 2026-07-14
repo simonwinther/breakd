@@ -9,6 +9,11 @@ interval = "30m"
 duration = "5m"
 after_minis = 2
 
+[schedule.rest]
+interval = "2h"
+duration = "30m"
+after_longs = 2
+
 [completion]
 manual_resume = false
 sound = "warm-rise" # warm-rise | soft-bloom | deep-halo | clean-chime
@@ -17,12 +22,16 @@ sound = "warm-rise" # warm-rise | soft-bloom | deep-halo | clean-chime
 enabled = true
 mini_lead = "10s"
 long_lead = "30s"
+rest_lead = "1m"
 actions = true
 
 [skip.mini]
 enabled = true
 
 [skip.long]
+enabled = true
+
+[skip.rest]
 enabled = true
 
 [postpone.mini]
@@ -33,6 +42,11 @@ duration = "2m"
 [postpone.long]
 enabled = true
 duration = "5m"
+# max_postponements = 2 # omit for unlimited postponements
+
+[postpone.rest]
+enabled = true
+duration = "10m"
 # max_postponements = 2 # omit for unlimited postponements
 
 [strict]

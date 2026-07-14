@@ -19,6 +19,10 @@ pub struct ScheduleContext {
     pub cycle_started_mono_ms: u64,
     pub next_due_mono_ms: u64,
     pub minis_since_long: u32,
+    #[serde(default)]
+    pub longs_since_rest: u32,
+    #[serde(default)]
+    pub rest_cycle_started_mono_ms: u64,
     pub pending: Option<PendingBreak>,
 }
 
@@ -59,6 +63,12 @@ pub enum SchedulerState {
         context: ScheduleContext,
     },
     LongBreak {
+        active: ActiveBreak,
+    },
+    PreRestBreak {
+        context: ScheduleContext,
+    },
+    RestBreak {
         active: ActiveBreak,
     },
     PausedIndefinitely {
@@ -131,6 +141,7 @@ pub struct SchedulerStatus {
     pub remaining_ms: Option<u64>,
     pub awaiting_resume: bool,
     pub minis_since_long: u32,
+    pub longs_since_rest: u32,
     pub active_session: Option<BreakSessionId>,
     pub postpone_count: u32,
     pub can_skip: bool,
@@ -315,6 +326,7 @@ impl Scheduler {
             Command::Postpone => self.postpone(now),
             Command::Mini => self.manual_break(BreakKind::Mini, now),
             Command::Long => self.manual_break(BreakKind::Long, now),
+            Command::Rest => self.manual_break(BreakKind::Rest, now),
             Command::Toggle => {
                 if matches!(
                     self.state,
@@ -353,6 +365,7 @@ impl Scheduler {
             remaining_ms,
             awaiting_resume,
             minis_since_long: context.map_or(0, |context| context.minis_since_long),
+            longs_since_rest: context.map_or(0, |context| context.longs_since_rest),
             active_session: active.map(|active| active.session_id),
             postpone_count: active
                 .map(|active| active.due.postpone_count)
@@ -381,6 +394,8 @@ impl Scheduler {
                     .monotonic_ms
                     .saturating_add(config.schedule.mini.interval.as_millis()),
                 minis_since_long: 0,
+                longs_since_rest: 0,
+                rest_cycle_started_mono_ms: now.monotonic_ms,
                 pending: None,
             },
         }
@@ -407,6 +422,7 @@ impl Scheduler {
                     self.state = match kind {
                         BreakKind::Mini => SchedulerState::PreMiniBreak { context },
                         BreakKind::Long => SchedulerState::PreLongBreak { context },
+                        BreakKind::Rest => SchedulerState::PreRestBreak { context },
                     };
                     if self.config.notifications.enabled {
                         return vec![Effect::Notify {
@@ -427,7 +443,14 @@ impl Scheduler {
             {
                 self.begin_scheduled_break(BreakKind::Long, context, now)
             }
-            SchedulerState::MiniBreak { active } | SchedulerState::LongBreak { active }
+            SchedulerState::PreRestBreak { context }
+                if now.monotonic_ms >= context.next_due_mono_ms =>
+            {
+                self.begin_scheduled_break(BreakKind::Rest, context, now)
+            }
+            SchedulerState::MiniBreak { active }
+            | SchedulerState::LongBreak { active }
+            | SchedulerState::RestBreak { active }
                 if now.boottime_ms >= active.ends_boot_ms =>
             {
                 self.expire_active(active, now)
@@ -449,6 +472,11 @@ impl Scheduler {
     }
 
     fn next_kind(&self, context: &ScheduleContext, at_mono_ms: u64) -> BreakKind {
+        let rest_elapsed = at_mono_ms.saturating_sub(context.rest_cycle_started_mono_ms)
+            >= self.config.schedule.rest.interval.as_millis();
+        if rest_elapsed && context.longs_since_rest >= self.config.schedule.rest.after_longs {
+            return BreakKind::Rest;
+        }
         let long_elapsed = at_mono_ms.saturating_sub(context.cycle_started_mono_ms)
             >= self.config.schedule.long.interval.as_millis();
         if long_elapsed && context.minis_since_long >= self.config.schedule.long.after_minis {
@@ -462,6 +490,7 @@ impl Scheduler {
         match kind {
             BreakKind::Mini => self.config.notifications.mini_lead.as_millis(),
             BreakKind::Long => self.config.notifications.long_lead.as_millis(),
+            BreakKind::Rest => self.config.notifications.rest_lead.as_millis(),
         }
     }
 
@@ -491,6 +520,8 @@ impl Scheduler {
             cycle_started_mono_ms: now.monotonic_ms,
             next_due_mono_ms: now.monotonic_ms,
             minis_since_long: 0,
+            longs_since_rest: 0,
+            rest_cycle_started_mono_ms: now.monotonic_ms,
             pending: None,
         });
         let due = PendingBreak {
@@ -532,6 +563,7 @@ impl Scheduler {
         self.state = match kind {
             BreakKind::Mini => SchedulerState::MiniBreak { active },
             BreakKind::Long => SchedulerState::LongBreak { active },
+            BreakKind::Rest => SchedulerState::RestBreak { active },
         };
         vec![effect]
     }
@@ -546,6 +578,7 @@ impl Scheduler {
         self.state = match active.due.kind {
             BreakKind::Mini => SchedulerState::MiniBreak { active },
             BreakKind::Long => SchedulerState::LongBreak { active },
+            BreakKind::Rest => SchedulerState::RestBreak { active },
         };
         play_completion_sound
             .then_some(Effect::PlayCompletionSound)
@@ -565,6 +598,13 @@ impl Scheduler {
             BreakKind::Long => {
                 context.minis_since_long = 0;
                 context.cycle_started_mono_ms = now.monotonic_ms;
+                context.longs_since_rest = context.longs_since_rest.saturating_add(1);
+            }
+            BreakKind::Rest => {
+                context.minis_since_long = 0;
+                context.cycle_started_mono_ms = now.monotonic_ms;
+                context.longs_since_rest = 0;
+                context.rest_cycle_started_mono_ms = now.monotonic_ms;
             }
         }
         context.pending = None;
@@ -626,6 +666,7 @@ impl Scheduler {
         let rule = match active.due.kind {
             BreakKind::Mini => &self.config.postpone.mini,
             BreakKind::Long => &self.config.postpone.long,
+            BreakKind::Rest => &self.config.postpone.rest,
         };
         if !rule.enabled {
             return Err(SchedulerError::PostponeDisabled);
@@ -796,6 +837,7 @@ impl Scheduler {
         match kind {
             BreakKind::Mini => self.config.schedule.mini.duration.as_millis(),
             BreakKind::Long => self.config.schedule.long.duration.as_millis(),
+            BreakKind::Rest => self.config.schedule.rest.duration.as_millis(),
         }
     }
 
@@ -829,6 +871,7 @@ impl Scheduler {
         match kind {
             BreakKind::Mini => self.config.skip.mini.enabled,
             BreakKind::Long => self.config.skip.long.enabled,
+            BreakKind::Rest => self.config.skip.rest.enabled,
         }
     }
 
@@ -842,6 +885,7 @@ impl Scheduler {
         let rule = match active.due.kind {
             BreakKind::Mini => &self.config.postpone.mini,
             BreakKind::Long => &self.config.postpone.long,
+            BreakKind::Rest => &self.config.postpone.rest,
         };
         rule.enabled
             && rule
@@ -860,7 +904,9 @@ impl Scheduler {
 
 fn active_break_in(state: &SchedulerState) -> Option<&ActiveBreak> {
     match state {
-        SchedulerState::MiniBreak { active } | SchedulerState::LongBreak { active } => Some(active),
+        SchedulerState::MiniBreak { active }
+        | SchedulerState::LongBreak { active }
+        | SchedulerState::RestBreak { active } => Some(active),
         SchedulerState::PausedIndefinitely { inner, .. }
         | SchedulerState::PausedUntil { inner, .. }
         | SchedulerState::Suspended { inner, .. } => active_break_in(inner),
@@ -872,10 +918,11 @@ fn context_in(state: &SchedulerState) -> Option<&ScheduleContext> {
     match state {
         SchedulerState::Running { context }
         | SchedulerState::PreMiniBreak { context }
-        | SchedulerState::PreLongBreak { context } => Some(context),
-        SchedulerState::MiniBreak { active } | SchedulerState::LongBreak { active } => {
-            Some(&active.context)
-        }
+        | SchedulerState::PreLongBreak { context }
+        | SchedulerState::PreRestBreak { context } => Some(context),
+        SchedulerState::MiniBreak { active }
+        | SchedulerState::LongBreak { active }
+        | SchedulerState::RestBreak { active } => Some(&active.context),
         SchedulerState::PausedIndefinitely { inner, .. }
         | SchedulerState::PausedUntil { inner, .. }
         | SchedulerState::Suspended { inner, .. } => context_in(inner),
@@ -887,8 +934,11 @@ fn state_is_overdue(state: &SchedulerState, now: ClockSample) -> bool {
     match state {
         SchedulerState::Running { context }
         | SchedulerState::PreMiniBreak { context }
-        | SchedulerState::PreLongBreak { context } => now.monotonic_ms >= context.next_due_mono_ms,
-        SchedulerState::MiniBreak { active } | SchedulerState::LongBreak { active } => {
+        | SchedulerState::PreLongBreak { context }
+        | SchedulerState::PreRestBreak { context } => now.monotonic_ms >= context.next_due_mono_ms,
+        SchedulerState::MiniBreak { active }
+        | SchedulerState::LongBreak { active }
+        | SchedulerState::RestBreak { active } => {
             !active.manual_resume && now.boottime_ms >= active.ends_boot_ms
         }
         SchedulerState::PausedIndefinitely { .. }
@@ -913,6 +963,10 @@ fn shift_state(state: SchedulerState, mono_delta: u64, boot_delta: u64) -> Sched
             shift_context(&mut context, mono_delta);
             SchedulerState::PreLongBreak { context }
         }
+        SchedulerState::PreRestBreak { mut context } => {
+            shift_context(&mut context, mono_delta);
+            SchedulerState::PreRestBreak { context }
+        }
         SchedulerState::MiniBreak { mut active } => {
             shift_active(&mut active, mono_delta, boot_delta);
             SchedulerState::MiniBreak { active }
@@ -921,12 +975,19 @@ fn shift_state(state: SchedulerState, mono_delta: u64, boot_delta: u64) -> Sched
             shift_active(&mut active, mono_delta, boot_delta);
             SchedulerState::LongBreak { active }
         }
+        SchedulerState::RestBreak { mut active } => {
+            shift_active(&mut active, mono_delta, boot_delta);
+            SchedulerState::RestBreak { active }
+        }
         other => other,
     }
 }
 
 fn shift_context(context: &mut ScheduleContext, mono_delta: u64) {
     context.cycle_started_mono_ms = context.cycle_started_mono_ms.saturating_add(mono_delta);
+    context.rest_cycle_started_mono_ms = context
+        .rest_cycle_started_mono_ms
+        .saturating_add(mono_delta);
     context.next_due_mono_ms = context.next_due_mono_ms.saturating_add(mono_delta);
 }
 
@@ -944,6 +1005,8 @@ fn state_name(state: &SchedulerState) -> &'static str {
         SchedulerState::MiniBreak { .. } => "mini-break",
         SchedulerState::PreLongBreak { .. } => "pre-long-break",
         SchedulerState::LongBreak { .. } => "long-break",
+        SchedulerState::PreRestBreak { .. } => "pre-rest-break",
+        SchedulerState::RestBreak { .. } => "rest-break",
         SchedulerState::PausedIndefinitely { .. } => "paused-indefinitely",
         SchedulerState::PausedUntil { .. } => "paused-until",
         SchedulerState::Suspended { .. } => "suspended",
@@ -956,6 +1019,7 @@ fn title_kind(kind: BreakKind) -> &'static str {
     match kind {
         BreakKind::Mini => "Mini",
         BreakKind::Long => "Long",
+        BreakKind::Rest => "Rest",
     }
 }
 
@@ -988,11 +1052,16 @@ mod tests {
         config.schedule.mini.duration = DurationMs::from_millis(100);
         config.schedule.long.interval = DurationMs::from_millis(3_000);
         config.schedule.long.duration = DurationMs::from_millis(300);
+        config.schedule.rest.interval = DurationMs::from_millis(8_000);
+        config.schedule.rest.duration = DurationMs::from_millis(500);
+        config.schedule.rest.after_longs = 2;
         config.notifications.mini_lead = DurationMs::from_millis(100);
         config.notifications.long_lead = DurationMs::from_millis(100);
+        config.notifications.rest_lead = DurationMs::from_millis(100);
         config.strict.minimum_visible = DurationMs::from_millis(20);
         config.postpone.mini.max_postponements = Some(1);
         config.postpone.long.max_postponements = Some(1);
+        config.postpone.rest.max_postponements = Some(1);
         Scheduler::new(config, "boot".into(), clock(0), "/tmp/breakd.sock".into())
     }
 
@@ -1494,6 +1563,150 @@ mod tests {
             scheduler.state(),
             SchedulerState::MiniBreak { .. }
         ));
+    }
+
+    #[test]
+    fn three_tier_cadence_reaches_a_rest_break() {
+        let mut scheduler = test_scheduler();
+        let mut starts = Vec::new();
+        let mut last_session = None;
+        for time in (0..=9_000).step_by(10) {
+            scheduler.handle_event(SchedulerEvent::Tick, clock(time));
+            let status = scheduler.status(clock(time));
+            if status.active_session != last_session {
+                if let (Some(_), Some(kind)) = (status.active_session, status.break_kind) {
+                    starts.push((kind, status.longs_since_rest));
+                }
+                last_session = status.active_session;
+            }
+        }
+        assert_eq!(
+            starts,
+            vec![
+                (BreakKind::Mini, 0),
+                (BreakKind::Mini, 0),
+                (BreakKind::Long, 0),
+                (BreakKind::Mini, 1),
+                (BreakKind::Mini, 1),
+                (BreakKind::Long, 1),
+                (BreakKind::Rest, 2),
+            ]
+        );
+        let status = scheduler.status(clock(9_000));
+        assert_eq!(status.minis_since_long, 0);
+        assert_eq!(status.longs_since_rest, 0);
+    }
+
+    #[test]
+    fn rest_defers_to_the_cadence_until_its_interval_elapses() {
+        let scheduler = test_scheduler();
+        let context = ScheduleContext {
+            cycle_started_mono_ms: 0,
+            next_due_mono_ms: 5_000,
+            minis_since_long: 2,
+            longs_since_rest: 2,
+            rest_cycle_started_mono_ms: 0,
+            pending: None,
+        };
+        // Rest interval (8s) has not elapsed at 5s, so the long tier wins.
+        assert_eq!(scheduler.next_kind(&context, 5_000), BreakKind::Long);
+        // Once elapsed, rest supersedes an equally due long break.
+        assert_eq!(scheduler.next_kind(&context, 8_000), BreakKind::Rest);
+        let mut context = context;
+        context.longs_since_rest = 1;
+        assert_eq!(scheduler.next_kind(&context, 8_000), BreakKind::Long);
+    }
+
+    #[test]
+    fn manual_rest_break_resets_all_counters() {
+        let mut scheduler = test_scheduler();
+        scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+        scheduler.handle_event(SchedulerEvent::Tick, clock(100));
+        scheduler
+            .handle_command(&Command::Long, clock(200))
+            .unwrap();
+        scheduler.handle_event(SchedulerEvent::Tick, clock(500));
+        let status = scheduler.status(clock(500));
+        assert_eq!(status.longs_since_rest, 1);
+
+        let effects = scheduler
+            .handle_command(&Command::Rest, clock(600))
+            .unwrap();
+        let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+            panic!("expected an overlay");
+        };
+        assert_eq!(spec.kind, BreakKind::Rest);
+        assert!(matches!(
+            scheduler.state(),
+            SchedulerState::RestBreak { .. }
+        ));
+
+        scheduler.handle_event(SchedulerEvent::Tick, clock(1_100));
+        assert!(matches!(scheduler.state(), SchedulerState::Running { .. }));
+        let status = scheduler.status(clock(1_100));
+        assert_eq!(status.minis_since_long, 0);
+        assert_eq!(status.longs_since_rest, 0);
+        assert_eq!(status.remaining_ms, Some(1_000));
+    }
+
+    #[test]
+    fn rest_postpone_uses_its_own_rule_and_preserves_the_kind() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.postpone.rest.duration = DurationMs::from_millis(700);
+        scheduler.handle_command(&Command::Rest, clock(0)).unwrap();
+        scheduler
+            .handle_command(&Command::Postpone, clock(20))
+            .unwrap();
+
+        let due = match scheduler.state() {
+            SchedulerState::Running { context } => context.next_due_mono_ms,
+            state => panic!("unexpected state {state:?}"),
+        };
+        assert_eq!(due, 720);
+        let effects = scheduler.handle_event(SchedulerEvent::Tick, clock(due));
+        let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+            panic!("expected the postponed overlay");
+        };
+        assert_eq!(spec.kind, BreakKind::Rest);
+        assert_eq!(
+            scheduler.handle_command(&Command::Postpone, clock(due + 20)),
+            Err(SchedulerError::PostponeLimit)
+        );
+    }
+
+    #[test]
+    fn old_snapshot_without_rest_fields_restores() {
+        let scheduler = test_scheduler();
+        let encoded = r#"{
+            "schema_version": 1,
+            "boot_id": "boot",
+            "state": {
+                "state": "running",
+                "context": {
+                    "cycle_started_mono_ms": 0,
+                    "next_due_mono_ms": 1000,
+                    "minis_since_long": 1,
+                    "pending": null
+                }
+            },
+            "last_clock": {
+                "monotonic_ms": 500,
+                "boottime_ms": 500,
+                "wall_unix_ms": 1700000000500
+            }
+        }"#;
+        let snapshot: Snapshot = serde_json::from_str(encoded).unwrap();
+        let restored = Scheduler::restore(
+            scheduler.config.clone(),
+            "boot".into(),
+            clock(500),
+            "/tmp/breakd.sock".into(),
+            snapshot,
+        );
+        let status = restored.status(clock(500));
+        assert_eq!(status.minis_since_long, 1);
+        assert_eq!(status.longs_since_rest, 0);
+        assert_eq!(status.remaining_ms, Some(500));
     }
 
     #[test]

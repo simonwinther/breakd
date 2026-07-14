@@ -9,8 +9,9 @@ use breakd_core::{
     AppConfig, BreakTiming, CompletionConfig, CompletionSound, ContentConfig, ContentSelector,
     DisplayConfig, DisplayMode, DurationMs, FullscreenBehavior, FullscreenConfig, HyprlandConfig,
     IdleConfig, KeyboardMode, Layer, LoggingConfig, LongBreakTiming, MissedBreakPolicy,
-    NotificationsConfig, PointerMode, PostponeConfig, PostponeRule, RecoveryConfig, ScheduleConfig,
-    SkipConfig, SkipRule, StartupConfig, StrictConfig, StrictMode, TrayConfig,
+    NotificationsConfig, PointerMode, PostponeConfig, PostponeRule, RecoveryConfig,
+    RestBreakTiming, ScheduleConfig, SkipConfig, SkipRule, StartupConfig, StrictConfig, StrictMode,
+    TrayConfig,
 };
 use nix::unistd::Uid;
 use thiserror::Error;
@@ -107,6 +108,7 @@ pub fn defaults() -> AppConfig {
                 duration: DurationMs::from_millis(5 * 60 * 1_000),
                 after_minis: 2,
             },
+            rest: RestBreakTiming::default(),
         },
         completion: CompletionConfig {
             manual_resume: false,
@@ -116,11 +118,13 @@ pub fn defaults() -> AppConfig {
             enabled: true,
             mini_lead: DurationMs::from_millis(10 * 1_000),
             long_lead: DurationMs::from_millis(30 * 1_000),
+            rest_lead: DurationMs::from_millis(60 * 1_000),
             actions: true,
         },
         skip: SkipConfig {
             mini: SkipRule { enabled: true },
             long: SkipRule { enabled: true },
+            rest: SkipRule { enabled: true },
         },
         postpone: PostponeConfig {
             mini: PostponeRule {
@@ -131,6 +135,11 @@ pub fn defaults() -> AppConfig {
             long: PostponeRule {
                 enabled: true,
                 duration: DurationMs::from_millis(5 * 60 * 1_000),
+                max_postponements: None,
+            },
+            rest: PostponeRule {
+                enabled: true,
+                duration: DurationMs::from_millis(10 * 60 * 1_000),
                 max_postponements: None,
             },
         },
@@ -333,8 +342,17 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             "long interval, duration, and after_minis must be positive".into(),
         ));
     }
+    if config.schedule.rest.interval.as_millis() == 0
+        || config.schedule.rest.duration.as_millis() == 0
+        || config.schedule.rest.after_longs == 0
+    {
+        return Err(ConfigError::Validation(
+            "rest interval, duration, and after_longs must be positive".into(),
+        ));
+    }
     if config.notifications.mini_lead >= config.schedule.mini.interval
         || config.notifications.long_lead >= config.schedule.long.interval
+        || config.notifications.rest_lead >= config.schedule.rest.interval
     {
         return Err(ConfigError::Validation(
             "notification lead must be shorter than its interval".into(),
@@ -343,6 +361,7 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
     for (name, rule) in [
         ("postpone.mini", &config.postpone.mini),
         ("postpone.long", &config.postpone.long),
+        ("postpone.rest", &config.postpone.rest),
     ] {
         if rule.enabled && rule.duration.as_millis() == 0 {
             return Err(ConfigError::Validation(format!(
@@ -523,6 +542,41 @@ mod tests {
         assert!(!decoded.completion.manual_resume);
         assert_eq!(decoded.completion.sound, CompletionSound::WarmRise);
         assert!(decoded.tray.enabled);
+    }
+
+    #[test]
+    fn old_config_without_rest_sections_parses() {
+        let mut value: toml::Value = toml::from_str(&example_toml()).unwrap();
+        let root = value.as_table_mut().unwrap();
+        root["schedule"].as_table_mut().unwrap().remove("rest");
+        root["notifications"]
+            .as_table_mut()
+            .unwrap()
+            .remove("rest_lead");
+        root["skip"].as_table_mut().unwrap().remove("rest");
+        root["postpone"].as_table_mut().unwrap().remove("rest");
+        let source = toml::to_string(&value).unwrap();
+        let decoded: AppConfig = toml::from_str(&source).unwrap();
+        assert_eq!(decoded, defaults());
+    }
+
+    #[test]
+    fn invalid_rest_schedule_is_rejected() {
+        let mut config = defaults();
+        config.schedule.rest.after_longs = 0;
+        assert!(validate(&config).is_err());
+
+        let mut config = defaults();
+        config.schedule.rest.interval = DurationMs::from_millis(0);
+        assert!(validate(&config).is_err());
+
+        let mut config = defaults();
+        config.notifications.rest_lead = config.schedule.rest.interval;
+        assert!(validate(&config).is_err());
+
+        let mut config = defaults();
+        config.postpone.rest.duration = DurationMs::from_millis(0);
+        assert!(validate(&config).is_err());
     }
 
     #[test]

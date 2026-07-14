@@ -229,6 +229,7 @@ dependencies = [
  "breakd-core",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

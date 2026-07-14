@@ -29,6 +29,7 @@ impl TrayState {
         match self.active_kind {
             Some(BreakKind::Mini) => format!("Mini break: {remaining}"),
             Some(BreakKind::Long) => format!("Long break: {remaining}"),
+            Some(BreakKind::Rest) => format!("Rest break: {remaining}"),
             None => format!("Next break: {remaining}"),
         }
     }
@@ -185,6 +186,7 @@ impl ksni::Tray for BreakdTray {
             ),
             self.command_item("Start mini break", Command::Mini, !has_active_break),
             self.command_item("Start long break", Command::Long, !has_active_break),
+            self.command_item("Start rest break", Command::Rest, !has_active_break),
             self.command_item("Skip break", Command::Skip, self.state.can_skip),
             self.command_item("Postpone break", Command::Postpone, self.state.can_postpone),
             ksni::MenuItem::Separator,
@@ -238,6 +240,13 @@ mod tests {
             ..running.clone()
         };
         assert_eq!(active.status_text(), "Long break: 1:01:01");
+
+        let resting = TrayState {
+            active_kind: Some(BreakKind::Rest),
+            remaining_seconds: Some(1_800),
+            ..running.clone()
+        };
+        assert_eq!(resting.status_text(), "Rest break: 30:00");
 
         let paused = TrayState {
             paused: true,

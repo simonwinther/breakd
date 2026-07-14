@@ -44,13 +44,19 @@ struct SettingsWidgets {
     long_interval: gtk::Entry,
     long_duration: gtk::Entry,
     long_after_minis: gtk::SpinButton,
+    rest_interval: gtk::Entry,
+    rest_duration: gtk::Entry,
+    rest_after_longs: gtk::SpinButton,
     notifications_enabled: gtk::Switch,
     mini_notification_lead: gtk::Entry,
     long_notification_lead: gtk::Entry,
+    rest_notification_lead: gtk::Entry,
     mini_skip: gtk::Switch,
     long_skip: gtk::Switch,
+    rest_skip: gtk::Switch,
     mini_postpone: PostponeWidgets,
     long_postpone: PostponeWidgets,
+    rest_postpone: PostponeWidgets,
     strict_mode: gtk::DropDown,
     strict_minimum: gtk::Entry,
     allow_postpone_during_lockout: gtk::Switch,
@@ -83,15 +89,21 @@ impl SettingsWidgets {
         config.schedule.long.interval = parse_duration(&self.long_interval, "Long interval")?;
         config.schedule.long.duration = parse_duration(&self.long_duration, "Long duration")?;
         config.schedule.long.after_minis = self.long_after_minis.value_as_int() as u32;
+        config.schedule.rest.interval = parse_duration(&self.rest_interval, "Rest interval")?;
+        config.schedule.rest.duration = parse_duration(&self.rest_duration, "Rest duration")?;
+        config.schedule.rest.after_longs = self.rest_after_longs.value_as_int() as u32;
 
         config.notifications.enabled = self.notifications_enabled.is_active();
         config.notifications.mini_lead =
             parse_duration(&self.mini_notification_lead, "Mini notification lead")?;
         config.notifications.long_lead =
             parse_duration(&self.long_notification_lead, "Long notification lead")?;
+        config.notifications.rest_lead =
+            parse_duration(&self.rest_notification_lead, "Rest notification lead")?;
 
         config.skip.mini.enabled = self.mini_skip.is_active();
         config.skip.long.enabled = self.long_skip.is_active();
+        config.skip.rest.enabled = self.rest_skip.is_active();
         update_postpone_rule(
             &mut config.postpone.mini,
             &self.mini_postpone,
@@ -101,6 +113,11 @@ impl SettingsWidgets {
             &mut config.postpone.long,
             &self.long_postpone,
             "Long postpone duration",
+        )?;
+        update_postpone_rule(
+            &mut config.postpone.rest,
+            &self.rest_postpone,
+            "Rest postpone duration",
         )?;
 
         config.strict.mode = strict_mode_from_index(self.strict_mode.selected());
@@ -145,10 +162,16 @@ fn build_window(
         notifications_enabled: schedule_widgets.5,
         mini_notification_lead: schedule_widgets.6,
         long_notification_lead: schedule_widgets.7,
+        rest_interval: schedule_widgets.8,
+        rest_duration: schedule_widgets.9,
+        rest_after_longs: schedule_widgets.10,
+        rest_notification_lead: schedule_widgets.11,
         mini_skip: action_widgets.0,
         long_skip: action_widgets.1,
         mini_postpone: action_widgets.2,
         long_postpone: action_widgets.3,
+        rest_skip: action_widgets.10,
+        rest_postpone: action_widgets.11,
         strict_mode: action_widgets.4,
         strict_minimum: action_widgets.5,
         allow_postpone_during_lockout: action_widgets.6,
@@ -277,6 +300,10 @@ type SchedulePageWidgets = (
     gtk::Switch,
     gtk::Entry,
     gtk::Entry,
+    gtk::Entry,
+    gtk::Entry,
+    gtk::SpinButton,
+    gtk::Entry,
 );
 
 fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidgets) {
@@ -286,6 +313,10 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
     let long_duration = duration_entry(config.schedule.long.duration);
     let long_after_minis = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
     long_after_minis.set_value(f64::from(config.schedule.long.after_minis));
+    let rest_interval = duration_entry(config.schedule.rest.interval);
+    let rest_duration = duration_entry(config.schedule.rest.duration);
+    let rest_after_longs = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+    rest_after_longs.set_value(f64::from(config.schedule.rest.after_longs));
 
     let mini_group = settings_group(
         "Mini breaks",
@@ -320,6 +351,27 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
             ),
         ],
     );
+    let rest_group = settings_group(
+        "Rest breaks",
+        "A rest break starts after both thresholds have been reached.",
+        &[
+            settings_row(
+                "Minimum interval",
+                "Time since the previous rest break.",
+                &rest_interval,
+            ),
+            settings_row(
+                "Duration",
+                "How long the overlay remains visible.",
+                &rest_duration,
+            ),
+            settings_row(
+                "Long-break threshold",
+                "Completed long breaks required before a rest break.",
+                &rest_after_longs,
+            ),
+        ],
+    );
 
     let notifications_enabled = gtk::Switch::builder()
         .active(config.notifications.enabled)
@@ -327,13 +379,17 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
         .build();
     let mini_notification_lead = duration_entry(config.notifications.mini_lead);
     let long_notification_lead = duration_entry(config.notifications.long_lead);
+    let rest_notification_lead = duration_entry(config.notifications.rest_lead);
     mini_notification_lead.set_sensitive(config.notifications.enabled);
     long_notification_lead.set_sensitive(config.notifications.enabled);
+    rest_notification_lead.set_sensitive(config.notifications.enabled);
     let mini_lead_for_toggle = mini_notification_lead.clone();
     let long_lead_for_toggle = long_notification_lead.clone();
+    let rest_lead_for_toggle = rest_notification_lead.clone();
     notifications_enabled.connect_active_notify(move |toggle| {
         mini_lead_for_toggle.set_sensitive(toggle.is_active());
         long_lead_for_toggle.set_sensitive(toggle.is_active());
+        rest_lead_for_toggle.set_sensitive(toggle.is_active());
     });
     let notification_group = settings_group(
         "Notifications",
@@ -341,7 +397,7 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
         &[
             settings_row(
                 "Pre-break notifications",
-                "Master switch for mini and long break notices.",
+                "Master switch for mini, long, and rest break notices.",
                 &notifications_enabled,
             ),
             settings_row(
@@ -354,11 +410,16 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
                 "How early to notify before a long break.",
                 &long_notification_lead,
             ),
+            settings_row(
+                "Rest-break notice",
+                "How early to notify before a rest break.",
+                &rest_notification_lead,
+            ),
         ],
     );
 
     (
-        settings_page(&[mini_group, long_group, notification_group]),
+        settings_page(&[mini_group, long_group, rest_group, notification_group]),
         (
             mini_interval,
             mini_duration,
@@ -368,6 +429,10 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
             notifications_enabled,
             mini_notification_lead,
             long_notification_lead,
+            rest_interval,
+            rest_duration,
+            rest_after_longs,
+            rest_notification_lead,
         ),
     )
 }
@@ -383,6 +448,8 @@ type ActionPageWidgets = (
     gtk::Switch,
     gtk::Switch,
     gtk::DropDown,
+    gtk::Switch,
+    PostponeWidgets,
 );
 
 fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) {
@@ -394,8 +461,13 @@ fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) 
         .active(config.skip.long.enabled)
         .valign(gtk::Align::Center)
         .build();
+    let rest_skip = gtk::Switch::builder()
+        .active(config.skip.rest.enabled)
+        .valign(gtk::Align::Center)
+        .build();
     let (mini_postpone, mini_postpone_rows) = postpone_controls(&config.postpone.mini);
     let (long_postpone, long_postpone_rows) = postpone_controls(&config.postpone.long);
+    let (rest_postpone, rest_postpone_rows) = postpone_controls(&config.postpone.rest);
 
     let mut mini_rows = vec![settings_row(
         "Allow skip",
@@ -409,6 +481,12 @@ fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) 
         &long_skip,
     )];
     long_rows.extend(long_postpone_rows);
+    let mut rest_rows = vec![settings_row(
+        "Allow skip",
+        "Show the Skip control for this break.",
+        &rest_skip,
+    )];
+    rest_rows.extend(rest_postpone_rows);
 
     let mini_group = settings_group(
         "Mini-break actions",
@@ -419,6 +497,11 @@ fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) 
         "Long-break actions",
         "Controls available while a long break is active.",
         &long_rows,
+    );
+    let rest_group = settings_group(
+        "Rest-break actions",
+        "Controls available while a rest break is active.",
+        &rest_rows,
     );
 
     let strict_mode = gtk::DropDown::from_strings(&["Off", "Delay controls", "Entire break"]);
@@ -490,7 +573,13 @@ fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) 
     );
 
     (
-        settings_page(&[mini_group, long_group, completion_group, strict_group]),
+        settings_page(&[
+            mini_group,
+            long_group,
+            rest_group,
+            completion_group,
+            strict_group,
+        ]),
         (
             mini_skip,
             long_skip,
@@ -502,6 +591,8 @@ fn actions_page(config: &AppConfig) -> (gtk::ScrolledWindow, ActionPageWidgets) 
             inhibit_shortcuts,
             manual_resume,
             completion_sound,
+            rest_skip,
+            rest_postpone,
         ),
     )
 }

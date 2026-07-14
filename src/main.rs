@@ -37,6 +37,8 @@ enum CliCommand {
     Mini,
     /// Start a long break immediately.
     Long,
+    /// Start a rest break immediately.
+    Rest,
     /// Toggle paused/running state.
     Toggle,
     /// Reload and validate the configuration.
@@ -94,6 +96,7 @@ async fn execute(arguments: Arguments) -> Result<()> {
         CliCommand::Postpone => send(Command::Postpone, false).await,
         CliCommand::Mini => send(Command::Mini, false).await,
         CliCommand::Long => send(Command::Long, false).await,
+        CliCommand::Rest => send(Command::Rest, false).await,
         CliCommand::Toggle => send(Command::Toggle, false).await,
         CliCommand::Reload => send(Command::Reload, false).await,
         CliCommand::Outputs { json } => send(Command::Outputs, json).await,

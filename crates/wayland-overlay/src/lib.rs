@@ -324,6 +324,7 @@ fn build_content(
     let title = gtk::Label::new(Some(match spec.kind {
         breakd_core::BreakKind::Mini => "Mini break",
         breakd_core::BreakKind::Long => "Long break",
+        breakd_core::BreakKind::Rest => "Rest break",
     }));
     title.add_css_class("breakd-title");
     panel.append(&title);
