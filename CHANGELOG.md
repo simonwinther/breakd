@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/simonwinther/breakd/compare/v0.1.6...v0.1.7) (2026-07-14)
+
+
+### Features
+
+* **settings:** add syncing mechanism to prevent re-entrant sync calls ([bd7b0f6](https://github.com/simonwinther/breakd/commit/bd7b0f68b5ed8742fc525258edc1db46d3c1b363))
+
 ## [0.1.6](https://github.com/simonwinther/breakd/compare/v0.1.5...v0.1.6) (2026-07-14)
 
 
