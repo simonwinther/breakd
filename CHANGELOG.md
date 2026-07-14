@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.6](https://github.com/simonwinther/breakd/compare/v0.1.5...v0.1.6) (2026-07-14)
+
+
+### Features
+
+* **scheduler, settings:** add new scheduling logic and tests ([1704ce8](https://github.com/simonwinther/breakd/commit/1704ce8d3427eb88c084295da59315bf04ccd05b))
+* **settings:** show version and update notice ([96934d7](https://github.com/simonwinther/breakd/commit/96934d7e730e0497ffa6cbdfecff39a16e2d2508))
+
 ## [0.1.5](https://github.com/simonwinther/breakd/compare/v0.1.4...v0.1.5) (2026-07-14)
 
 
