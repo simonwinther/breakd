@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/simonwinther/breakd/compare/v0.1.10...v0.1.11) (2026-07-15)
+
+
+### Bug Fixes
+
+* recover co-op breaks and connection status ([#16](https://github.com/simonwinther/breakd/issues/16)) ([d19f522](https://github.com/simonwinther/breakd/commit/d19f522e5155dbe20823bcc243de00516d159c9e))
+
 ## [0.1.10](https://github.com/simonwinther/breakd/compare/v0.1.9...v0.1.10) (2026-07-15)
 
 
