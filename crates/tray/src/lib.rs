@@ -13,6 +13,7 @@ pub struct TrayState {
     pub paused: bool,
     pub active_kind: Option<BreakKind>,
     pub remaining_seconds: Option<u64>,
+    pub awaiting_resume: bool,
     pub can_skip: bool,
     pub can_postpone: bool,
 }
@@ -21,6 +22,14 @@ impl TrayState {
     pub fn status_text(&self) -> String {
         if self.paused {
             return "Schedule paused".into();
+        }
+        if self.awaiting_resume {
+            return match self.active_kind {
+                Some(BreakKind::Mini) => "Mini break complete — resume when ready".into(),
+                Some(BreakKind::Long) => "Long break complete — resume when ready".into(),
+                Some(BreakKind::Rest) => "Rest break complete — resume when ready".into(),
+                None => "Break complete — resume when ready".into(),
+            };
         }
         let remaining = self
             .remaining_seconds
@@ -189,6 +198,11 @@ impl ksni::Tray for BreakdTray {
             self.command_item("Start rest break", Command::Rest, !has_active_break),
             self.command_item("Skip break", Command::Skip, self.state.can_skip),
             self.command_item("Postpone break", Command::Postpone, self.state.can_postpone),
+            self.command_item(
+                "Resume work",
+                Command::ResumeBreak,
+                self.state.awaiting_resume,
+            ),
             ksni::MenuItem::Separator,
             self.command_item(
                 "Reset schedule",
@@ -229,6 +243,7 @@ mod tests {
             paused: false,
             active_kind: None,
             remaining_seconds: Some(65),
+            awaiting_resume: false,
             can_skip: false,
             can_postpone: false,
         };
@@ -253,6 +268,19 @@ mod tests {
             ..running
         };
         assert_eq!(paused.status_text(), "Schedule paused");
+
+        let waiting = TrayState {
+            paused: false,
+            active_kind: Some(BreakKind::Long),
+            remaining_seconds: Some(0),
+            awaiting_resume: true,
+            can_skip: false,
+            can_postpone: false,
+        };
+        assert_eq!(
+            waiting.status_text(),
+            "Long break complete — resume when ready"
+        );
     }
 
     #[tokio::test]
@@ -263,6 +291,7 @@ mod tests {
                 paused: false,
                 active_kind: None,
                 remaining_seconds: Some(60),
+                awaiting_resume: false,
                 can_skip: false,
                 can_postpone: false,
             },
@@ -288,6 +317,7 @@ mod tests {
                 paused: false,
                 active_kind: None,
                 remaining_seconds: Some(60),
+                awaiting_resume: false,
                 can_skip: false,
                 can_postpone: false,
             },
@@ -300,5 +330,32 @@ mod tests {
         };
         (item.activate)(&mut tray);
         assert_eq!(receiver.recv().await, Some(TrayAction::OpenSettings));
+    }
+
+    #[tokio::test]
+    async fn completed_break_menu_item_sends_resume_break() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut tray = BreakdTray {
+            state: TrayState {
+                paused: false,
+                active_kind: Some(BreakKind::Long),
+                remaining_seconds: Some(0),
+                awaiting_resume: true,
+                can_skip: false,
+                can_postpone: false,
+            },
+            sender,
+            name: "breakd-dev".into(),
+        };
+        let menu = ksni::Tray::menu(&tray);
+        let ksni::MenuItem::Standard(item) = menu.into_iter().nth(8).unwrap() else {
+            panic!("expected resume work menu item");
+        };
+        assert!(item.enabled);
+        (item.activate)(&mut tray);
+        assert_eq!(
+            receiver.recv().await,
+            Some(TrayAction::Command(Command::ResumeBreak))
+        );
     }
 }
