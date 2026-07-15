@@ -21,6 +21,22 @@ cargo run -p breakd-relay -- --listen 127.0.0.1:8787
 breakd coop host --relay ws://127.0.0.1:8787/ws
 ```
 
+For a private Tailscale room, listen on the host's Tailscale interface (or on
+`0.0.0.0` with a firewall rule restricted to `tailscale0`) and use the host's
+MagicDNS name in the relay URL:
+
+```bash
+breakd-relay --listen 0.0.0.0:8787
+breakd coop host --relay ws://my-host.my-tailnet.ts.net:8787/ws
+```
+
+Prefer the MagicDNS name over a copied `100.x.y.z` address when a machine is
+shared between tailnets. Tailscale can present that same machine under different
+IPv4 addresses to its owner and to a shared user, while the MagicDNS name maps to
+the correct address for each person. The invite is a `breakd` CLI value, not a
+web page: the guest must run `breakd coop join '<complete invite>'` rather than
+opening it in a browser.
+
 Plain `ws://` exposes the room token to the network. Use it only on localhost or
 another trusted, encrypted network. For internet use, keep the process bound to
 localhost and put a TLS reverse proxy in front of it. For example, a Caddy site
@@ -70,6 +86,12 @@ or public chat.
 Run `breakd coop host` again to make a new token and invalidate the previous room
 from that host. `breakd coop leave` clears the relay URL and token and resets a
 fresh local schedule.
+
+`breakd coop host` waits until the host is connected before printing its final
+status. `breakd coop join` waits for the first authoritative host snapshot, so a
+successful return means `connected`, `host_present`, and `following_host` are all
+true. A timeout only stops the CLI wait; the daemon keeps reconnecting in the
+background and `breakd coop status` shows its latest state and error.
 
 ## Synchronization and failure behavior
 

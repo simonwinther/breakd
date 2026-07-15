@@ -29,11 +29,8 @@ trait LoginManager {
     interface = "org.freedesktop.login1.Session"
 )]
 trait LoginSession {
-    #[zbus(signal)]
-    fn lock(&self) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    fn unlock(&self) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn locked_hint(&self) -> zbus::Result<bool>;
 }
 
 pub async fn spawn_logind_monitor(sender: mpsc::Sender<PowerEvent>) -> zbus::Result<()> {
@@ -48,8 +45,7 @@ pub async fn spawn_logind_monitor(sender: mpsc::Sender<PowerEvent>) -> zbus::Res
         .build()
         .await?;
     let mut sleep_events = manager.receive_prepare_for_sleep().await?;
-    let mut lock_events = session.receive_lock().await?;
-    let mut unlock_events = session.receive_unlock().await?;
+    let mut locked_events = session.receive_locked_hint_changed().await;
 
     tokio::spawn(async move {
         loop {
@@ -64,8 +60,16 @@ pub async fn spawn_logind_monitor(sender: mpsc::Sender<PowerEvent>) -> zbus::Res
                         }
                     }
                 }
-                Some(_) = lock_events.next() => Some(PowerEvent::Locked),
-                Some(_) = unlock_events.next() => Some(PowerEvent::Unlocked),
+                Some(change) = locked_events.next() => {
+                    match change.get().await {
+                        Ok(true) => Some(PowerEvent::Locked),
+                        Ok(false) => Some(PowerEvent::Unlocked),
+                        Err(error) => {
+                            tracing::warn!(%error, "invalid logind lock state");
+                            None
+                        }
+                    }
+                },
                 else => break,
             };
             if let Some(event) = event

@@ -1,8 +1,10 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use breakd_core::{Command, DurationMs, OverlaySpec};
+use breakd_core::{Command, DurationMs, OverlaySpec, Response};
 use clap::{Parser, Subcommand};
+use serde_json::Value;
+use tokio::time::{Duration, Instant, sleep};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -126,10 +128,8 @@ async fn execute(arguments: Arguments) -> Result<()> {
         CliCommand::Outputs { json } => send(Command::Outputs, json).await,
         CliCommand::Doctor { json } => send(Command::Doctor, json).await,
         CliCommand::Coop { command } => match command {
-            CoopCommand::Host { relay } => {
-                send(Command::CoopHost { relay_url: relay }, false).await
-            }
-            CoopCommand::Join { invite } => send(Command::CoopJoin { invite }, false).await,
+            CoopCommand::Host { relay } => host_coop_room(relay).await,
+            CoopCommand::Join { invite } => join_coop_room(invite).await,
             CoopCommand::Leave => send(Command::CoopLeave, false).await,
             CoopCommand::Status { json } => send(Command::CoopStatus, json).await,
         },
@@ -138,6 +138,11 @@ async fn execute(arguments: Arguments) -> Result<()> {
 }
 
 async fn send(command: Command, json: bool) -> Result<()> {
+    let response = request(command).await?;
+    print_response(response, json)
+}
+
+async fn request(command: Command) -> Result<Response> {
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         breakd_ipc::request(breakd_config::socket_path(), command),
@@ -147,6 +152,10 @@ async fn send(command: Command, json: bool) -> Result<()> {
     if !response.ok {
         bail!(response.message);
     }
+    Ok(response)
+}
+
+fn print_response(response: Response, json: bool) -> Result<()> {
     if json {
         println!(
             "{}",
@@ -159,6 +168,83 @@ async fn send(command: Command, json: bool) -> Result<()> {
         println!("{}", response.message);
     }
     Ok(())
+}
+
+async fn host_coop_room(relay_url: String) -> Result<()> {
+    let response = request(Command::CoopHost { relay_url }).await?;
+    let invite = response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("invite"))
+        .and_then(Value::as_str)
+        .context("daemon did not return a co-op invite")?
+        .to_owned();
+    let status = wait_for_coop(CoopReadiness::Host).await?;
+    println!("co-op room created");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "invite": invite,
+            "status": status,
+        }))?
+    );
+    Ok(())
+}
+
+async fn join_coop_room(invite: String) -> Result<()> {
+    request(Command::CoopJoin { invite }).await?;
+    let status = wait_for_coop(CoopReadiness::Guest).await?;
+    println!("joined co-op room");
+    println!("{}", serde_json::to_string_pretty(&status)?);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CoopReadiness {
+    Host,
+    Guest,
+}
+
+async fn wait_for_coop(expected: CoopReadiness) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let failed_status = loop {
+        sleep(Duration::from_millis(100)).await;
+        let response = request(Command::CoopStatus).await?;
+        let status = response.data.unwrap_or(Value::Null);
+        if coop_is_ready(&status, expected) {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            break status;
+        }
+    };
+    let detail = failed_status
+        .get("last_error")
+        .and_then(Value::as_str)
+        .map(|error| format!(": {error}"))
+        .unwrap_or_default();
+    bail!(
+        "co-op connection did not become ready within 5 seconds{detail}; the daemon will keep retrying"
+    )
+}
+
+fn coop_is_ready(status: &Value, expected: CoopReadiness) -> bool {
+    let connected = status
+        .get("connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let host_present = status
+        .get("host_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let role_ready = match expected {
+        CoopReadiness::Host => true,
+        CoopReadiness::Guest => status
+            .get("following_host")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    connected && host_present && role_ready
 }
 
 fn run_overlay() -> Result<()> {
@@ -189,5 +275,28 @@ fn init_logging() {
         builder.json().init();
     } else {
         builder.compact().init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coop_join_waits_for_the_first_host_snapshot() {
+        let connecting = serde_json::json!({
+            "connected": true,
+            "host_present": true,
+            "following_host": false,
+        });
+        let following = serde_json::json!({
+            "connected": true,
+            "host_present": true,
+            "following_host": true,
+        });
+
+        assert!(!coop_is_ready(&connecting, CoopReadiness::Guest));
+        assert!(coop_is_ready(&following, CoopReadiness::Guest));
+        assert!(coop_is_ready(&connecting, CoopReadiness::Host));
     }
 }

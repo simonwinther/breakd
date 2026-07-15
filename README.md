@@ -191,6 +191,12 @@ breakd coop join 'wss://breaks.example.net/ws#breakd=<room-token>'
 breakd coop status
 ```
 
+When using Tailscale, use the host's MagicDNS name in the relay URL rather than
+its numeric `100.x.y.z` address. A machine shared between tailnets can appear
+under different Tailscale IPv4 addresses to its owner and guest; MagicDNS maps
+the same hostname correctly for both. The invite is consumed by `breakd coop
+join` and will not join a room when opened in a browser.
+
 The host remains authoritative: a guest's skip, postpone, pause, resume, reset,
 or manual-break command is sent to the host, and the resulting host snapshot is
 mirrored back. Both systems should have normal network time synchronization

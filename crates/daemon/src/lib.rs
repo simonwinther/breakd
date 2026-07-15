@@ -1,5 +1,8 @@
 use std::{
     collections::VecDeque,
+    ffi::OsString,
+    fs,
+    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -248,6 +251,7 @@ pub async fn run() -> Result<()> {
                 if coop.holds_local_schedule() {
                     continue;
                 }
+                tracing::info!(?event, "logind state changed");
                 let now = clock.sample()?;
                 let scheduler_event = match event {
                     PowerEvent::PreparingForSleep => SchedulerEvent::SuspendStarted,
@@ -655,6 +659,7 @@ fn tray_state(status: SchedulerStatus) -> TrayState {
         remaining_seconds: status
             .remaining_ms
             .map(|milliseconds| milliseconds.saturating_add(999) / 1_000),
+        awaiting_resume: status.awaiting_resume,
         can_skip: status.can_skip,
         can_postpone: status.can_postpone,
     }
@@ -849,15 +854,18 @@ impl OverlaySupervisor {
         self.stop_any().await;
         let executable = std::env::current_exe()?;
         let serialized = serde_json::to_string(&spec)?;
-        let child = TokioCommand::new(executable)
+        let wayland_display = overlay_wayland_display()?;
+        let mut command = TokioCommand::new(executable);
+        command
             .arg("overlay")
             .env("BREAKD_OVERLAY_SPEC", serialized)
+            .env("WAYLAND_DISPLAY", &wayland_display)
+            .env("XDG_SESSION_TYPE", "wayland")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .context("spawn overlay child")?;
+            .kill_on_drop(true);
+        let child = command.spawn().context("spawn overlay child")?;
         self.active = Some((spec.session_id, child));
         Ok(())
     }
@@ -892,6 +900,58 @@ impl OverlaySupervisor {
     }
 }
 
+fn overlay_wayland_display() -> Result<OsString> {
+    if let Some(display) = std::env::var_os("WAYLAND_DISPLAY").filter(|value| !value.is_empty()) {
+        return Ok(display);
+    }
+
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .context("WAYLAND_DISPLAY is unset and XDG_RUNTIME_DIR is unavailable")?;
+    discover_wayland_display(&runtime_dir)
+}
+
+fn discover_wayland_display(runtime_dir: &Path) -> Result<OsString> {
+    let mut candidates = fs::read_dir(runtime_dir)
+        .with_context(|| {
+            format!(
+                "inspect Wayland runtime directory {}",
+                runtime_dir.display()
+            )
+        })?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("wayland-"))
+                && entry.file_type().is_ok_and(|kind| kind.is_socket())
+        })
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    candidates.sort();
+
+    match candidates.as_slice() {
+        [display_name] => {
+            tracing::info!(display = %display_name.to_string_lossy(), "discovered Wayland display for overlay");
+            Ok(display_name.clone())
+        }
+        [] => anyhow::bail!(
+            "WAYLAND_DISPLAY is unset and no Wayland socket exists in {}",
+            runtime_dir.display()
+        ),
+        displays => anyhow::bail!(
+            "WAYLAND_DISPLAY is unset and multiple Wayland sockets exist in {}: {}",
+            runtime_dir.display(),
+            displays
+                .iter()
+                .map(|display| display.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 fn command_message(command: &Command) -> &'static str {
     match command {
         Command::Pause { .. } => "schedule paused",
@@ -921,6 +981,8 @@ pub fn socket_exists(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixListener;
+
     use super::*;
 
     #[test]
@@ -929,5 +991,22 @@ mod tests {
             installed_data_directory(Path::new("/nix/store/hash-breakd/bin/breakd")),
             Some(PathBuf::from("/nix/store/hash-breakd/share/breakd"))
         );
+    }
+
+    #[test]
+    fn discovers_the_only_live_wayland_socket() {
+        let runtime_dir =
+            std::env::temp_dir().join(format!("breakd-wayland-discovery-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&runtime_dir).unwrap();
+        fs::write(runtime_dir.join("wayland-1.lock"), "ignored").unwrap();
+        let listener = UnixListener::bind(runtime_dir.join("wayland-1")).unwrap();
+
+        assert_eq!(
+            discover_wayland_display(&runtime_dir).unwrap(),
+            OsString::from("wayland-1")
+        );
+
+        drop(listener);
+        fs::remove_dir_all(runtime_dir).unwrap();
     }
 }
