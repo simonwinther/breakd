@@ -51,7 +51,7 @@ duration = "10m"
 
 [strict]
 mode = "delay" # off | delay | entire
-minimum_visible = "10s"
+minimum_visible = "10s" # delay: how long pause/reset stay locked; skip/postpone are always immediate
 allow_postpone_during_lockout = false
 inhibit_shortcuts = true
 

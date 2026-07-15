@@ -377,8 +377,7 @@ impl Scheduler {
             can_skip: !paused
                 && !awaiting_resume
                 && active.is_some_and(|active| {
-                    self.skip_available(active.due.kind)
-                        && now.boottime_ms >= active.strict_until_boot_ms
+                    self.skip_available(active.due.kind) && !self.dismissal_locked(active, now)
                 }),
             can_postpone: !paused
                 && !awaiting_resume
@@ -625,7 +624,15 @@ impl Scheduler {
             .active_break()
             .cloned()
             .ok_or(SchedulerError::NoActiveBreak)?;
-        self.ensure_dismissal_allowed(now)?;
+        if awaiting_manual_resume(&active, now) {
+            return Err(SchedulerError::AwaitingResume);
+        }
+        if !self.skip_available(active.due.kind) {
+            return Err(SchedulerError::SkipDisabled);
+        }
+        if self.dismissal_locked(&active, now) {
+            return Err(SchedulerError::StrictMode);
+        }
         Ok(self.finish_active(active, now))
     }
 
@@ -671,8 +678,7 @@ impl Scheduler {
         if !rule.enabled {
             return Err(SchedulerError::PostponeDisabled);
         }
-        if now.boottime_ms < active.strict_until_boot_ms
-            && !self.config.strict.allow_postpone_during_lockout
+        if self.dismissal_locked(&active, now) && !self.config.strict.allow_postpone_during_lockout
         {
             return Err(SchedulerError::StrictMode);
         }
@@ -857,7 +863,11 @@ impl Scheduler {
             kind: active.due.kind,
             duration: DurationMs::from_millis(active.ends_boot_ms.saturating_sub(now.boottime_ms)),
             strict_remaining: DurationMs::from_millis(
-                active.strict_until_boot_ms.saturating_sub(now.boottime_ms),
+                if self.config.strict.mode == StrictMode::Entire {
+                    active.strict_until_boot_ms.saturating_sub(now.boottime_ms)
+                } else {
+                    0
+                },
             ),
             can_skip: self.skip_available(active.due.kind),
             can_postpone: self.postpone_available(active),
@@ -877,8 +887,17 @@ impl Scheduler {
 
     fn postpone_allowed(&self, active: &ActiveBreak, now: ClockSample) -> bool {
         self.postpone_available(active)
-            && (now.boottime_ms >= active.strict_until_boot_ms
+            && (!self.dismissal_locked(active, now)
                 || self.config.strict.allow_postpone_during_lockout)
+    }
+
+    /// Whether strict mode currently blocks dismissing the break with skip or
+    /// postpone. Only `StrictMode::Entire` holds those controls for the whole
+    /// break; the `Delay` mode's minimum-visible window intentionally does not
+    /// gate skip or postpone, so the user can act on the break immediately.
+    fn dismissal_locked(&self, active: &ActiveBreak, now: ClockSample) -> bool {
+        self.config.strict.mode == StrictMode::Entire
+            && now.boottime_ms < active.strict_until_boot_ms
     }
 
     fn postpone_available(&self, active: &ActiveBreak) -> bool {
@@ -1251,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_rejects_early_skip() {
+    fn delay_mode_allows_immediate_skip_and_postpone() {
         let mut scheduler = test_scheduler();
         let effects = scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
         let Effect::StartOverlay(spec) = &effects[0] else {
@@ -1259,13 +1278,47 @@ mod tests {
         };
         assert!(spec.can_skip);
         assert!(spec.can_postpone);
+        // The minimum-visible delay no longer gates skip or postpone, so the
+        // overlay enables both controls from the first frame.
+        assert_eq!(spec.strict_remaining, DurationMs::from_millis(0));
+        assert!(scheduler.status(clock(1)).can_skip);
+        assert!(scheduler.status(clock(1)).can_postpone);
+        assert!(
+            scheduler
+                .handle_command(&Command::Postpone, clock(1))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn entire_strict_mode_locks_skip_and_postpone_for_the_whole_break() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.strict.mode = StrictMode::Entire;
+        let effects = scheduler.handle_command(&Command::Long, clock(0)).unwrap();
+        let Effect::StartOverlay(spec) = &effects[0] else {
+            panic!("expected an overlay");
+        };
+        // Entire mode keeps the controls locked for the whole break.
+        assert_eq!(spec.strict_remaining, spec.duration);
+        assert!(!scheduler.status(clock(10)).can_skip);
         assert!(!scheduler.status(clock(10)).can_postpone);
         assert_eq!(
             scheduler.handle_command(&Command::Skip, clock(10)),
             Err(SchedulerError::StrictMode)
         );
-        assert!(scheduler.status(clock(20)).can_postpone);
-        assert!(scheduler.handle_command(&Command::Skip, clock(20)).is_ok());
+        assert_eq!(
+            scheduler.handle_command(&Command::Postpone, clock(10)),
+            Err(SchedulerError::StrictMode)
+        );
+
+        // The postpone-during-lockout escape hatch still applies in Entire mode.
+        scheduler.config.strict.allow_postpone_during_lockout = true;
+        assert!(scheduler.status(clock(10)).can_postpone);
+        assert!(
+            scheduler
+                .handle_command(&Command::Postpone, clock(10))
+                .is_ok()
+        );
     }
 
     #[test]
