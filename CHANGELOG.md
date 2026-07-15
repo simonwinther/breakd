@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/simonwinther/breakd/compare/v0.1.11...v0.1.12) (2026-07-15)
+
+
+### Features
+
+* add collaboration settings and host policy sync ([#18](https://github.com/simonwinther/breakd/issues/18)) ([65272b9](https://github.com/simonwinther/breakd/commit/65272b997833844f997da31287d444fbec6d9bbf))
+
 ## [0.1.11](https://github.com/simonwinther/breakd/compare/v0.1.10...v0.1.11) (2026-07-15)
 
 
