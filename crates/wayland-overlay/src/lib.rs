@@ -32,6 +32,18 @@ pub fn run(spec: OverlaySpec, config: AppConfig) -> Result<(), String> {
             return;
         }
 
+        // Keep the overlay process alive for the whole break even if every
+        // window is torn down. When the compositor removes or powers off the
+        // outputs the overlay is anchored to (for example display power
+        // management after the user steps away during a long break), GTK closes
+        // those layer-shell windows; without an explicit hold the application
+        // would quit as soon as the last window closes, leaving the break still
+        // counting down in the daemon with nothing on screen. The hold is
+        // released when the countdown ends (the timer below calls `quit`) or
+        // when the daemon stops the overlay. Surfaces are recreated by
+        // `reconcile` when the outputs come back.
+        let hold = application.hold();
+
         install_css(&config);
         let manager = Rc::new(RefCell::new(OverlayManager::new(
             application.clone(),
@@ -50,6 +62,9 @@ pub fn run(spec: OverlaySpec, config: AppConfig) -> Result<(), String> {
 
         let manager_for_timer = manager.clone();
         glib::timeout_add_local(Duration::from_millis(200), move || {
+            // Own the application hold for the lifetime of the countdown so the
+            // process survives losing all of its windows mid-break.
+            let _hold = &hold;
             let mut manager = manager_for_timer.borrow_mut();
             if manager.update_countdown() {
                 glib::ControlFlow::Continue
