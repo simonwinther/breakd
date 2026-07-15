@@ -1,18 +1,12 @@
 [package]
-name = "breakd-scheduler"
+name = "breakd-coop"
 version = "0.1.9"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-breakd-coop = { path = "../coop" }
 breakd-core = { path = "../core" }
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-breakd-config = { path = "../config" }
-proptest.workspace = true
-serde_json.workspace = true

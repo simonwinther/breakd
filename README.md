@@ -12,6 +12,8 @@ This is why you should use my shit instead of Stretchly. xD
 
 ## Install
 
+### Arch Linux
+
 Install the AUR package and start the user service:
 
 ```bash
@@ -21,6 +23,57 @@ breakd status
 ```
 
 `breakd` runs as your user. It does not need root access or access to `/dev/input`.
+
+### NixOS
+
+Add the flake and enable its NixOS module:
+
+```nix
+{
+  inputs.breakd.url = "github:simonwinther/breakd";
+
+  outputs = { nixpkgs, breakd, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        breakd.nixosModules.default
+        ({ ... }: { services.breakd.enable = true; })
+      ];
+    };
+  };
+}
+```
+
+Update the `breakd` input when a new release is available, then rebuild:
+
+```bash
+nix flake update breakd
+sudo nixos-rebuild switch --flake .#my-host
+```
+
+For a non-declarative installation, install the package directly and enable its
+user service:
+
+```bash
+nix profile install github:simonwinther/breakd
+systemctl --user enable --now breakd.service
+```
+
+The desktop package stays separate from the optional relay package. A NixOS
+machine that will host co-op rooms can enable the small system service without
+installing the GTK desktop application:
+
+```nix
+services.breakd-relay = {
+  enable = true;
+  listen = "127.0.0.1:8787";
+  maxRoomSize = 8;
+  maxRooms = 256;
+};
+```
+
+Expose that private listener through a TLS reverse proxy before using it over
+the internet. The package is also available directly as `.#breakd-relay`.
 
 ## Configure
 
@@ -119,6 +172,40 @@ enabled = true
 
 The tray shows the current schedule status and provides pause/resume, manual break, skip, postpone, reset, and reload actions. It needs a StatusNotifierItem host, such as Waybar's `tray` module. Disabling the tray does not affect the scheduler or overlays.
 
+### Co-op breaks
+
+Co-op mode lets one host own the schedule while guests mirror its next break,
+active break, pause state, and permitted actions. Each computer still renders
+its own native overlay with its own monitor and message settings.
+
+Start the relay on a server (or use a relay you trust), then create a room:
+
+```bash
+breakd coop host --relay wss://breaks.example.net/ws
+```
+
+Send the printed invite to your friend. They join by quoting the complete value:
+
+```bash
+breakd coop join 'wss://breaks.example.net/ws#breakd=<room-token>'
+breakd coop status
+```
+
+The host remains authoritative: a guest's skip, postpone, pause, resume, reset,
+or manual-break command is sent to the host, and the resulting host snapshot is
+mirrored back. Both systems should have normal network time synchronization
+enabled because scheduled starts use absolute timestamps. If snapshots stop for
+10 seconds, the guest starts a fresh local schedule; reconnecting adopts the
+host again. Leave at any time with `breakd coop leave`.
+
+The relay has no database, accounts, schedule engine, or desktop dependencies.
+It retains only the latest snapshot while a host is connected. Room tokens are
+sent in the WebSocket `Authorization` header rather than the request URL; the
+invite keeps the token in its URL fragment. Anyone holding an invite can enter
+that room, so share it as a secret and create a new room to rotate it. See
+[Co-op deployment and protocol](docs/coop.md) for relay setup and operational
+details.
+
 ### Pointer and keyboard input
 
 `display.pointer_mode` controls where clicks go during a break:
@@ -177,6 +264,10 @@ breakd toggle
 breakd reload
 breakd outputs [--json]
 breakd doctor [--json]
+breakd coop host --relay <ws://-or-wss://-url>
+breakd coop join '<invite>'
+breakd coop status [--json]
+breakd coop leave
 breakd settings
 breakd example-config
 ```
@@ -273,6 +364,7 @@ install -Dm644 packaging/systemd/breakd-local.service \
   ~/.config/systemd/user/breakd.service
 install -Dm644 packaging/io.github.simonwinther.breakd.settings.desktop \
   ~/.local/share/applications/io.github.simonwinther.breakd.settings.desktop
+install -Dm644 crates/platform-linux/assets/*.oga -t ~/.local/share/breakd
 install -Dm644 THIRD_PARTY_NOTICES.md \
   ~/.local/share/licenses/breakd/THIRD_PARTY_NOTICES.md
 install -Dm600 config.example.toml ~/.config/breakd/config.toml

@@ -7,11 +7,11 @@ use std::{
 
 use breakd_core::{
     AppConfig, BreakTiming, CompletionConfig, CompletionSound, ContentConfig, ContentSelector,
-    DisplayConfig, DisplayMode, DurationMs, FullscreenBehavior, FullscreenConfig, HyprlandConfig,
-    IdleConfig, KeyboardMode, Layer, LoggingConfig, LongBreakTiming, MissedBreakPolicy,
-    NotificationsConfig, PointerMode, PostponeConfig, PostponeRule, RecoveryConfig,
-    RestBreakTiming, ScheduleConfig, SkipConfig, SkipRule, StartupConfig, StrictConfig, StrictMode,
-    TrayConfig,
+    CoopConfig, CoopMode, DisplayConfig, DisplayMode, DurationMs, FullscreenBehavior,
+    FullscreenConfig, HyprlandConfig, IdleConfig, KeyboardMode, Layer, LoggingConfig,
+    LongBreakTiming, MissedBreakPolicy, NotificationsConfig, PointerMode, PostponeConfig,
+    PostponeRule, RecoveryConfig, RestBreakTiming, ScheduleConfig, SkipConfig, SkipRule,
+    StartupConfig, StrictConfig, StrictMode, TrayConfig,
 };
 use nix::unistd::Uid;
 use thiserror::Error;
@@ -194,6 +194,7 @@ pub fn defaults() -> AppConfig {
             submap_fallback: true,
         },
         tray: TrayConfig { enabled: true },
+        coop: CoopConfig::default(),
         logging: LoggingConfig {
             level: "info".into(),
             format: "journald".into(),
@@ -410,6 +411,31 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             "logging.format must be journald, compact, or json".into(),
         ));
     }
+    if config.coop.disconnect_grace.as_millis() == 0
+        || config.coop.disconnect_grace.as_millis() > 5 * 60 * 1_000
+    {
+        return Err(ConfigError::Validation(
+            "coop.disconnect_grace must be between 1ms and 5m".into(),
+        ));
+    }
+    if config.coop.mode != CoopMode::Off {
+        let relay_url = config.coop.relay_url.as_deref().ok_or_else(|| {
+            ConfigError::Validation("coop.relay_url is required in host or guest mode".into())
+        })?;
+        if !breakd_coop::valid_relay_url(relay_url) {
+            return Err(ConfigError::Validation(
+                "coop.relay_url must be a ws:// or wss:// URL without a fragment".into(),
+            ));
+        }
+        let room_token = config.coop.room_token.as_deref().ok_or_else(|| {
+            ConfigError::Validation("coop.room_token is required in host or guest mode".into())
+        })?;
+        if !breakd_coop::valid_room_token(room_token) {
+            return Err(ConfigError::Validation(
+                "coop.room_token must contain exactly 32 hexadecimal characters".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -490,6 +516,21 @@ mod tests {
         let mut config = defaults();
         config.display.dim_color = "#nothex".into();
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn enabled_coop_requires_a_valid_relay_and_room_token() {
+        let mut config = defaults();
+        config.coop.mode = CoopMode::Guest;
+        assert!(validate(&config).is_err());
+
+        config.coop.relay_url = Some("https://relay.example/ws".into());
+        config.coop.room_token = Some("not-secret-enough".into());
+        assert!(validate(&config).is_err());
+
+        config.coop.relay_url = Some("wss://relay.example/ws".into());
+        config.coop.room_token = Some("0123456789abcdef0123456789abcdef".into());
+        assert!(validate(&config).is_ok());
     }
 
     #[test]

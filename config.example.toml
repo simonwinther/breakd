@@ -189,6 +189,10 @@ submap_fallback = true # enforce blocking through a temporary Hyprland submap
 [tray]
 enabled = true
 
+[coop]
+mode = "off" # off | host | guest; use `breakd coop host` or `breakd coop join`
+disconnect_grace = "10s" # resume a fresh local schedule if the host disappears
+
 [logging]
 level = "info"
 format = "journald"

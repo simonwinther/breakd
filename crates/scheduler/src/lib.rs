@@ -1,3 +1,4 @@
+use breakd_coop::{CoopPhase, CoopSnapshot, ScheduledBreak, SharedBreak};
 use breakd_core::{
     AppConfig, BreakKind, BreakSessionId, ClockSample, Command, DueBreakId, DurationMs,
     MissedBreakPolicy, OverlaySpec, StrictMode,
@@ -12,6 +13,18 @@ pub struct PendingBreak {
     pub id: DueBreakId,
     pub kind: BreakKind,
     pub postpone_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirrored: Option<MirroredBreakPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirroredBreakPolicy {
+    pub duration_ms: u64,
+    pub strict_duration_ms: u64,
+    pub strict_entire: bool,
+    pub manual_resume: bool,
+    pub can_skip: bool,
+    pub can_postpone: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,9 +350,14 @@ impl Scheduler {
                     self.pause(None, now)
                 }
             }
-            Command::Status | Command::Reload | Command::Outputs | Command::Doctor => {
-                Err(SchedulerError::DaemonCommand)
-            }
+            Command::Status
+            | Command::Reload
+            | Command::Outputs
+            | Command::Doctor
+            | Command::CoopHost { .. }
+            | Command::CoopJoin { .. }
+            | Command::CoopLeave
+            | Command::CoopStatus => Err(SchedulerError::DaemonCommand),
         }
     }
 
@@ -377,12 +395,245 @@ impl Scheduler {
             can_skip: !paused
                 && !awaiting_resume
                 && active.is_some_and(|active| {
-                    self.skip_available(active.due.kind) && !self.dismissal_locked(active, now)
+                    active.due.mirrored.as_ref().map_or_else(
+                        || self.skip_available(active.due.kind),
+                        |policy| policy.can_skip,
+                    ) && !self.dismissal_locked(active, now)
                 }),
             can_postpone: !paused
                 && !awaiting_resume
-                && active.is_some_and(|active| self.postpone_allowed(active, now)),
+                && active.is_some_and(|active| {
+                    active.due.mirrored.as_ref().map_or_else(
+                        || self.postpone_allowed(active, now),
+                        |policy| policy.can_postpone,
+                    )
+                }),
         }
+    }
+
+    pub fn coop_snapshot(
+        &mut self,
+        host_id: uuid::Uuid,
+        revision: u64,
+        now: ClockSample,
+    ) -> (CoopSnapshot, bool) {
+        let prepared_pending = prepare_pending_for_coop(&mut self.state, &self.config);
+        let status = self.status(now);
+        let paused = matches!(
+            self.state,
+            SchedulerState::PausedIndefinitely { .. } | SchedulerState::PausedUntil { .. }
+        );
+        let resume_at_unix_ms = match &self.state {
+            SchedulerState::PausedUntil { resume_mono_ms, .. } => {
+                Some(wall_deadline_from_mono(*resume_mono_ms, now))
+            }
+            _ => None,
+        };
+        let phase = if matches!(
+            self.state,
+            SchedulerState::Suspended { .. }
+                | SchedulerState::IdleReset { .. }
+                | SchedulerState::Recovering { .. }
+        ) {
+            CoopPhase::Unavailable {
+                reason: state_name(&self.state).into(),
+            }
+        } else if let Some(active) = self.active_break() {
+            CoopPhase::Break {
+                active: SharedBreak {
+                    due_id: active.due.id,
+                    session_id: active.session_id,
+                    kind: active.due.kind,
+                    started_unix_ms: wall_deadline_from_boot(active.started_boot_ms, now),
+                    ends_unix_ms: wall_deadline_from_boot(active.ends_boot_ms, now),
+                    strict_until_unix_ms: wall_deadline_from_boot(active.strict_until_boot_ms, now),
+                    strict_entire: self.config.strict.mode == StrictMode::Entire,
+                    manual_resume: active.manual_resume,
+                    completion_sound_emitted: active.completion_sound_emitted,
+                    can_skip: self.skip_available(active.due.kind),
+                    can_postpone: self.postpone_available(active),
+                },
+            }
+        } else if let Some(context) = self.context() {
+            let due = context
+                .pending
+                .as_ref()
+                .expect("co-op snapshot prepares a pending break");
+            let duration_ms = self.break_duration(due.kind);
+            CoopPhase::Working {
+                next: ScheduledBreak {
+                    due_id: due.id,
+                    kind: due.kind,
+                    starts_unix_ms: wall_deadline_from_mono(context.next_due_mono_ms, now),
+                    duration_ms,
+                    strict_duration_ms: self.strict_duration(duration_ms),
+                    strict_entire: self.config.strict.mode == StrictMode::Entire,
+                    manual_resume: self.config.completion.manual_resume,
+                    can_skip: self.skip_available(due.kind),
+                    can_postpone: self.postpone_available_for(due.kind, due.postpone_count),
+                },
+            }
+        } else {
+            CoopPhase::Unavailable {
+                reason: state_name(&self.state).into(),
+            }
+        };
+
+        (
+            CoopSnapshot {
+                host_id,
+                revision,
+                generated_unix_ms: now.wall_unix_ms,
+                paused,
+                resume_at_unix_ms,
+                phase,
+                minis_since_long: status.minis_since_long,
+                longs_since_rest: status.longs_since_rest,
+                postpone_count: status.postpone_count,
+                can_skip: status.can_skip,
+                can_postpone: status.can_postpone,
+            },
+            prepared_pending,
+        )
+    }
+
+    pub fn adopt_coop_snapshot(
+        &mut self,
+        snapshot: &CoopSnapshot,
+        now: ClockSample,
+    ) -> Vec<Effect> {
+        let old_visible = visible_active(&self.state).map(|active| active.session_id);
+        let context = |pending: Option<PendingBreak>, next_due_mono_ms: u64| ScheduleContext {
+            cycle_started_mono_ms: now.monotonic_ms,
+            next_due_mono_ms,
+            minis_since_long: snapshot.minis_since_long,
+            longs_since_rest: snapshot.longs_since_rest,
+            rest_cycle_started_mono_ms: now.monotonic_ms,
+            pending,
+        };
+
+        let base = match &snapshot.phase {
+            CoopPhase::Working { next } => {
+                let policy = MirroredBreakPolicy {
+                    duration_ms: next.duration_ms,
+                    strict_duration_ms: next.strict_duration_ms,
+                    strict_entire: next.strict_entire,
+                    manual_resume: next.manual_resume,
+                    can_skip: next.can_skip,
+                    can_postpone: next.can_postpone,
+                };
+                let due = PendingBreak {
+                    id: next.due_id,
+                    kind: next.kind,
+                    postpone_count: snapshot.postpone_count,
+                    mirrored: Some(policy),
+                };
+                if now.wall_unix_ms >= next.starts_unix_ms {
+                    let active = ActiveBreak {
+                        context: context(None, now.monotonic_ms),
+                        due,
+                        session_id: BreakSessionId(next.due_id.0),
+                        started_boot_ms: boot_deadline_from_wall(next.starts_unix_ms, now),
+                        ends_boot_ms: boot_deadline_from_wall(
+                            next.starts_unix_ms.saturating_add(next.duration_ms),
+                            now,
+                        ),
+                        strict_until_boot_ms: boot_deadline_from_wall(
+                            next.starts_unix_ms.saturating_add(next.strict_duration_ms),
+                            now,
+                        ),
+                        manual_resume: next.manual_resume,
+                        completion_sound_emitted: false,
+                    };
+                    match next.kind {
+                        BreakKind::Mini => SchedulerState::MiniBreak { active },
+                        BreakKind::Long => SchedulerState::LongBreak { active },
+                        BreakKind::Rest => SchedulerState::RestBreak { active },
+                    }
+                } else {
+                    SchedulerState::Running {
+                        context: context(
+                            Some(due),
+                            mono_deadline_from_wall(next.starts_unix_ms, now),
+                        ),
+                    }
+                }
+            }
+            CoopPhase::Break { active } => {
+                let ends_boot_ms = boot_deadline_from_wall(active.ends_unix_ms, now);
+                let strict_until_boot_ms =
+                    boot_deadline_from_wall(active.strict_until_unix_ms, now);
+                let duration_ms = active.ends_unix_ms.saturating_sub(active.started_unix_ms);
+                let strict_duration_ms = active
+                    .strict_until_unix_ms
+                    .saturating_sub(active.started_unix_ms);
+                let active = ActiveBreak {
+                    context: context(None, now.monotonic_ms),
+                    due: PendingBreak {
+                        id: active.due_id,
+                        kind: active.kind,
+                        postpone_count: snapshot.postpone_count,
+                        mirrored: Some(MirroredBreakPolicy {
+                            duration_ms,
+                            strict_duration_ms,
+                            strict_entire: active.strict_entire,
+                            manual_resume: active.manual_resume,
+                            can_skip: active.can_skip,
+                            can_postpone: active.can_postpone,
+                        }),
+                    },
+                    session_id: active.session_id,
+                    started_boot_ms: boot_deadline_from_wall(active.started_unix_ms, now),
+                    ends_boot_ms,
+                    strict_until_boot_ms,
+                    manual_resume: active.manual_resume,
+                    completion_sound_emitted: active.completion_sound_emitted,
+                };
+                match active.due.kind {
+                    BreakKind::Mini => SchedulerState::MiniBreak { active },
+                    BreakKind::Long => SchedulerState::LongBreak { active },
+                    BreakKind::Rest => SchedulerState::RestBreak { active },
+                }
+            }
+            CoopPhase::Unavailable { reason } => SchedulerState::Recovering {
+                reason: format!("co-op host unavailable: {reason}"),
+            },
+        };
+        self.state = if snapshot.paused {
+            match snapshot.resume_at_unix_ms {
+                Some(resume_at) => SchedulerState::PausedUntil {
+                    inner: Box::new(base),
+                    paused_at: now,
+                    resume_mono_ms: mono_deadline_from_wall(resume_at, now),
+                },
+                None => SchedulerState::PausedIndefinitely {
+                    inner: Box::new(base),
+                    paused_at: now,
+                },
+            }
+        } else {
+            base
+        };
+        self.last_clock = now;
+
+        let new_visible = visible_active(&self.state);
+        let mut effects = Vec::with_capacity(2);
+        if old_visible != new_visible.map(|active| active.session_id) {
+            if let Some(session_id) = old_visible {
+                effects.push(Effect::StopOverlay { session_id });
+            }
+            if let Some(active) = new_visible
+                && (active.manual_resume || active.ends_boot_ms > now.boottime_ms)
+            {
+                effects.push(Effect::StartOverlay(self.overlay_spec(active, now)));
+            }
+        }
+        effects
+    }
+
+    pub fn reset_after_coop_disconnect(&mut self, now: ClockSample) -> Vec<Effect> {
+        self.last_clock = now;
+        self.reset(now)
     }
 
     fn fresh_running(config: &AppConfig, now: ClockSample) -> SchedulerState {
@@ -414,6 +665,7 @@ impl Scheduler {
                         id: DueBreakId::new(),
                         kind,
                         postpone_count: 0,
+                        mirrored: None,
                     });
                     if now.monotonic_ms >= context.next_due_mono_ms {
                         return self.begin_scheduled_break(kind, context, now);
@@ -503,6 +755,7 @@ impl Scheduler {
             id: DueBreakId::new(),
             kind,
             postpone_count: 0,
+            mirrored: None,
         });
         self.begin_break(kind, context, due, now)
     }
@@ -527,6 +780,7 @@ impl Scheduler {
             id: DueBreakId::new(),
             kind,
             postpone_count: 0,
+            mirrored: None,
         };
         Ok(self.begin_break(kind, context, due, now))
     }
@@ -538,24 +792,32 @@ impl Scheduler {
         due: PendingBreak,
         now: ClockSample,
     ) -> Vec<Effect> {
-        let duration = self.break_duration(kind);
+        let duration = due
+            .mirrored
+            .as_ref()
+            .map_or_else(|| self.break_duration(kind), |policy| policy.duration_ms);
         let ends_boot_ms = now.boottime_ms.saturating_add(duration);
-        let strict_until_boot_ms = match self.config.strict.mode {
-            StrictMode::Off => now.boottime_ms,
-            StrictMode::Delay => now
-                .boottime_ms
-                .saturating_add(self.config.strict.minimum_visible.as_millis())
-                .min(ends_boot_ms),
-            StrictMode::Entire => ends_boot_ms,
-        };
+        let strict_until_boot_ms =
+            now.boottime_ms
+                .saturating_add(due.mirrored.as_ref().map_or_else(
+                    || self.strict_duration(duration),
+                    |policy| policy.strict_duration_ms,
+                ));
+        let manual_resume = due
+            .mirrored
+            .as_ref()
+            .map_or(self.config.completion.manual_resume, |policy| {
+                policy.manual_resume
+            });
+        let session_id = BreakSessionId(due.id.0);
         let active = ActiveBreak {
             context,
             due,
-            session_id: BreakSessionId::new(),
+            session_id,
             started_boot_ms: now.boottime_ms,
             ends_boot_ms,
             strict_until_boot_ms,
-            manual_resume: self.config.completion.manual_resume,
+            manual_resume,
             completion_sound_emitted: false,
         };
         let effect = Effect::StartOverlay(self.overlay_spec(&active, now));
@@ -847,6 +1109,19 @@ impl Scheduler {
         }
     }
 
+    fn strict_duration(&self, break_duration: u64) -> u64 {
+        match self.config.strict.mode {
+            StrictMode::Off => 0,
+            StrictMode::Delay => self
+                .config
+                .strict
+                .minimum_visible
+                .as_millis()
+                .min(break_duration),
+            StrictMode::Entire => break_duration,
+        }
+    }
+
     fn overlay_spec(&self, active: &ActiveBreak, now: ClockSample) -> OverlaySpec {
         let message =
             if self.config.content.show_message && !self.config.content.messages.is_empty() {
@@ -863,14 +1138,27 @@ impl Scheduler {
             kind: active.due.kind,
             duration: DurationMs::from_millis(active.ends_boot_ms.saturating_sub(now.boottime_ms)),
             strict_remaining: DurationMs::from_millis(
-                if self.config.strict.mode == StrictMode::Entire {
+                if active
+                    .due
+                    .mirrored
+                    .as_ref()
+                    .map_or(self.config.strict.mode == StrictMode::Entire, |policy| {
+                        policy.strict_entire
+                    })
+                {
                     active.strict_until_boot_ms.saturating_sub(now.boottime_ms)
                 } else {
                     0
                 },
             ),
-            can_skip: self.skip_available(active.due.kind),
-            can_postpone: self.postpone_available(active),
+            can_skip: active.due.mirrored.as_ref().map_or_else(
+                || self.skip_available(active.due.kind),
+                |policy| policy.can_skip,
+            ),
+            can_postpone: active.due.mirrored.as_ref().map_or_else(
+                || self.postpone_available(active),
+                |policy| policy.can_postpone,
+            ),
             manual_resume: active.manual_resume,
             message,
             socket_path: self.socket_path.clone(),
@@ -896,12 +1184,22 @@ impl Scheduler {
     /// break; the `Delay` mode's minimum-visible window intentionally does not
     /// gate skip or postpone, so the user can act on the break immediately.
     fn dismissal_locked(&self, active: &ActiveBreak, now: ClockSample) -> bool {
-        self.config.strict.mode == StrictMode::Entire
+        active
+            .due
+            .mirrored
+            .as_ref()
+            .map_or(self.config.strict.mode == StrictMode::Entire, |policy| {
+                policy.strict_entire
+            })
             && now.boottime_ms < active.strict_until_boot_ms
     }
 
     fn postpone_available(&self, active: &ActiveBreak) -> bool {
-        let rule = match active.due.kind {
+        self.postpone_available_for(active.due.kind, active.due.postpone_count)
+    }
+
+    fn postpone_available_for(&self, kind: BreakKind, postpone_count: u32) -> bool {
+        let rule = match kind {
             BreakKind::Mini => &self.config.postpone.mini,
             BreakKind::Long => &self.config.postpone.long,
             BreakKind::Rest => &self.config.postpone.rest,
@@ -909,7 +1207,7 @@ impl Scheduler {
         rule.enabled
             && rule
                 .max_postponements
-                .is_none_or(|maximum| active.due.postpone_count < maximum)
+                .is_none_or(|maximum| postpone_count < maximum)
     }
 
     fn active_break(&self) -> Option<&ActiveBreak> {
@@ -930,6 +1228,84 @@ fn active_break_in(state: &SchedulerState) -> Option<&ActiveBreak> {
         | SchedulerState::PausedUntil { inner, .. }
         | SchedulerState::Suspended { inner, .. } => active_break_in(inner),
         _ => None,
+    }
+}
+
+fn visible_active(state: &SchedulerState) -> Option<&ActiveBreak> {
+    match state {
+        SchedulerState::MiniBreak { active }
+        | SchedulerState::LongBreak { active }
+        | SchedulerState::RestBreak { active } => Some(active),
+        _ => None,
+    }
+}
+
+fn prepare_pending_for_coop(state: &mut SchedulerState, config: &AppConfig) -> bool {
+    match state {
+        SchedulerState::Running { context }
+        | SchedulerState::PreMiniBreak { context }
+        | SchedulerState::PreLongBreak { context }
+        | SchedulerState::PreRestBreak { context } => {
+            if context.pending.is_some() {
+                return false;
+            }
+            let rest_elapsed = context
+                .next_due_mono_ms
+                .saturating_sub(context.rest_cycle_started_mono_ms)
+                >= config.schedule.rest.interval.as_millis();
+            let long_elapsed = context
+                .next_due_mono_ms
+                .saturating_sub(context.cycle_started_mono_ms)
+                >= config.schedule.long.interval.as_millis();
+            let kind = if rest_elapsed
+                && context.longs_since_rest >= config.schedule.rest.after_longs
+            {
+                BreakKind::Rest
+            } else if long_elapsed && context.minis_since_long >= config.schedule.long.after_minis {
+                BreakKind::Long
+            } else {
+                BreakKind::Mini
+            };
+            context.pending = Some(PendingBreak {
+                id: DueBreakId::new(),
+                kind,
+                postpone_count: 0,
+                mirrored: None,
+            });
+            true
+        }
+        SchedulerState::PausedIndefinitely { inner, .. }
+        | SchedulerState::PausedUntil { inner, .. } => prepare_pending_for_coop(inner, config),
+        SchedulerState::MiniBreak { .. }
+        | SchedulerState::LongBreak { .. }
+        | SchedulerState::RestBreak { .. }
+        | SchedulerState::Suspended { .. }
+        | SchedulerState::IdleReset { .. }
+        | SchedulerState::Recovering { .. } => false,
+    }
+}
+
+fn wall_deadline_from_mono(deadline_mono_ms: u64, now: ClockSample) -> u64 {
+    translate_deadline(deadline_mono_ms, now.monotonic_ms, now.wall_unix_ms)
+}
+
+fn wall_deadline_from_boot(deadline_boot_ms: u64, now: ClockSample) -> u64 {
+    translate_deadline(deadline_boot_ms, now.boottime_ms, now.wall_unix_ms)
+}
+
+fn mono_deadline_from_wall(deadline_wall_ms: u64, now: ClockSample) -> u64 {
+    translate_deadline(deadline_wall_ms, now.wall_unix_ms, now.monotonic_ms)
+}
+
+fn boot_deadline_from_wall(deadline_wall_ms: u64, now: ClockSample) -> u64 {
+    translate_deadline(deadline_wall_ms, now.wall_unix_ms, now.boottime_ms)
+}
+
+fn translate_deadline(deadline: u64, source_now: u64, destination_now: u64) -> u64 {
+    if deadline >= source_now {
+        destination_now.saturating_add(deadline - source_now)
+    } else {
+        destination_now.saturating_sub(source_now - deadline)
     }
 }
 
@@ -1216,6 +1592,67 @@ mod tests {
                 .handle_event(SchedulerEvent::Tick, clock(100))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn coop_guests_start_the_same_session_with_the_hosts_duration() {
+        let mut host = test_scheduler();
+        let mut guest = test_scheduler();
+        let mut guest_config = guest.config.clone();
+        guest_config.schedule.mini.duration = DurationMs::from_millis(800);
+        guest.replace_config(guest_config);
+
+        let (snapshot, _) = host.coop_snapshot(uuid::Uuid::nil(), 1, clock(0));
+        assert!(guest.adopt_coop_snapshot(&snapshot, clock(50)).is_empty());
+
+        let host_effects = host.handle_event(SchedulerEvent::Tick, clock(1_000));
+        let guest_effects = guest.handle_event(SchedulerEvent::Tick, clock(1_000));
+        let host_session = host.status(clock(1_000)).active_session.unwrap();
+        let guest_status = guest.status(clock(1_000));
+
+        assert_eq!(guest_status.active_session, Some(host_session));
+        assert_eq!(guest_status.remaining_ms, Some(100));
+        assert!(matches!(host_effects.as_slice(), [Effect::StartOverlay(_)]));
+        assert!(matches!(
+            guest_effects.as_slice(),
+            [Effect::StartOverlay(_)]
+        ));
+    }
+
+    #[test]
+    fn a_working_snapshot_arriving_just_after_deadline_starts_without_flicker() {
+        let mut host = test_scheduler();
+        let mut guest = test_scheduler();
+        let (snapshot, _) = host.coop_snapshot(uuid::Uuid::nil(), 1, clock(0));
+
+        let effects = guest.adopt_coop_snapshot(&snapshot, clock(1_001));
+        let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+            panic!("expected a late working snapshot to start its break");
+        };
+        let CoopPhase::Working { next } = &snapshot.phase else {
+            panic!("host should still be working");
+        };
+        assert_eq!(spec.session_id.0, next.due_id.0);
+        assert_eq!(spec.duration, DurationMs::from_millis(99));
+    }
+
+    #[test]
+    fn coop_guest_uses_its_own_break_message_when_joining_mid_break() {
+        let mut host = test_scheduler();
+        host.handle_command(&Command::Mini, clock(0)).unwrap();
+        let (snapshot, _) = host.coop_snapshot(uuid::Uuid::nil(), 1, clock(20));
+
+        let mut guest = test_scheduler();
+        let mut guest_config = guest.config.clone();
+        guest_config.content.messages = vec!["A local message".into()];
+        guest.replace_config(guest_config);
+        let effects = guest.adopt_coop_snapshot(&snapshot, clock(20));
+
+        let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+            panic!("expected the mirrored overlay to start");
+        };
+        assert_eq!(spec.message.as_deref(), Some("A local message"));
+        assert_eq!(spec.duration, DurationMs::from_millis(80));
     }
 
     #[test]

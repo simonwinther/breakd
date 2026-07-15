@@ -35,6 +35,13 @@ jobs:
           fetch-depth: 0
           ref: ${{ steps.release.outputs.tag_name }}
 
+      - uses: cachix/install-nix-action@v31
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+
+      - name: Verify release Nix package
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: nix build .#breakd .#breakd-relay --print-build-logs
+
       - name: Build source archive
         id: source
         if: ${{ steps.release.outputs.release_created == 'true' }}

@@ -5,7 +5,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use breakd_core::{BreakSessionId, Command, CompletionSound, OverlaySpec, Response};
+use breakd_coop::{CoopAction, Invite};
+use breakd_core::{
+    BreakSessionId, Command, CompletionSound, CoopConfig, CoopMode, OverlaySpec, Response,
+};
 use breakd_ipc::{IPC_VERSION, IncomingRequest, Server};
 use breakd_platform_linux::{
     EventSoundClient, HyprlandClient, IdleCapability, IdleEvent, LinuxClock, NotificationClient,
@@ -19,6 +22,10 @@ use tokio::{
     sync::mpsc,
     time::{Duration, Instant, interval},
 };
+
+mod coop;
+
+use coop::{AcceptedEvent, CoopRuntime};
 
 pub async fn run() -> Result<()> {
     let instance = breakd_config::RuntimeInstance::current();
@@ -57,6 +64,9 @@ pub async fn run() -> Result<()> {
     };
     state_store.save(&scheduler.snapshot())?;
 
+    let (coop_event_sender, mut coop_event_receiver) = mpsc::channel(64);
+    let mut coop = CoopRuntime::new(config.coop.clone(), coop_event_sender);
+
     let server = Server::bind(&socket_path)?;
     let (request_sender, mut request_receiver) = mpsc::channel::<IncomingRequest>(32);
     tokio::spawn(async move {
@@ -91,7 +101,11 @@ pub async fn run() -> Result<()> {
     };
     let mut overlay = OverlaySupervisor::default();
     apply_effects(
-        scheduler.startup_effects(now),
+        if coop.holds_local_schedule() {
+            Vec::new()
+        } else {
+            scheduler.startup_effects(now)
+        },
         &mut overlay,
         &notifications,
         event_sounds.as_ref(),
@@ -119,21 +133,38 @@ pub async fn run() -> Result<()> {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut recent_requests: VecDeque<(uuid::Uuid, Response)> = VecDeque::new();
     let mut terminate = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut next_coop_publish = Instant::now();
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let now = clock.sample()?;
-                let previous = scheduler.state().clone();
-                let effects = scheduler.handle_event(SchedulerEvent::Tick, now);
-                persist_if_changed(&state_store, &scheduler, &previous)?;
-                apply_effects(
-                    effects,
-                    &mut overlay,
-                    &notifications,
-                    event_sounds.as_ref(),
-                    config.completion.sound,
-                ).await;
+                if coop.take_fallback_transition() {
+                    tracing::warn!("co-op host timed out; starting a fresh local schedule");
+                    let effects = scheduler.reset_after_coop_disconnect(now);
+                    state_store.save(&scheduler.snapshot())?;
+                    apply_effects(
+                        effects,
+                        &mut overlay,
+                        &notifications,
+                        event_sounds.as_ref(),
+                        config.completion.sound,
+                    ).await;
+                }
+                if !coop.holds_local_schedule() || coop.has_fresh_snapshot() {
+                    let previous = scheduler.state().clone();
+                    let effects = scheduler.handle_event(SchedulerEvent::Tick, now);
+                    if !coop.has_fresh_snapshot() {
+                        persist_if_changed(&state_store, &scheduler, &previous)?;
+                    }
+                    apply_effects(
+                        effects,
+                        &mut overlay,
+                        &notifications,
+                        event_sounds.as_ref(),
+                        config.completion.sound,
+                    ).await;
+                }
                 if let Some((session_id, reason)) = overlay.poll_exit().await? {
                     let status = scheduler.status(now);
                     if status.active_session == Some(session_id)
@@ -170,9 +201,13 @@ pub async fn run() -> Result<()> {
                     &mut overlay,
                     &notifications,
                     event_sounds.as_ref(),
+                    &mut coop,
                     idle_capability,
                     tray.available(),
                 ).await;
+                if coop.is_host() {
+                    next_coop_publish = Instant::now();
+                }
                 recent_requests.push_back((incoming.request.request_id, response.clone()));
                 if recent_requests.len() > 128 {
                     recent_requests.pop_front();
@@ -191,11 +226,15 @@ pub async fn run() -> Result<()> {
                             &mut overlay,
                             &notifications,
                             event_sounds.as_ref(),
+                            &mut coop,
                             idle_capability,
                             tray.available(),
                         ).await {
                             Ok((message, _)) => tracing::info!(%message, "tray command handled"),
                             Err(error) => tracing::warn!(%error, "tray command failed"),
+                        }
+                        if coop.is_host() {
+                            next_coop_publish = Instant::now();
                         }
                     }
                     TrayAction::OpenSettings => {
@@ -206,6 +245,9 @@ pub async fn run() -> Result<()> {
                 }
             }
             Some(event) = power_receiver.recv() => {
+                if coop.holds_local_schedule() {
+                    continue;
+                }
                 let now = clock.sample()?;
                 let scheduler_event = match event {
                     PowerEvent::PreparingForSleep => SchedulerEvent::SuspendStarted,
@@ -223,8 +265,14 @@ pub async fn run() -> Result<()> {
                     event_sounds.as_ref(),
                     config.completion.sound,
                 ).await;
+                if coop.is_host() {
+                    next_coop_publish = Instant::now();
+                }
             }
             Some(event) = idle_receiver.recv() => {
+                if coop.holds_local_schedule() {
+                    continue;
+                }
                 let now = clock.sample()?;
                 let scheduler_event = match event {
                     IdleEvent::Idled => SchedulerEvent::IdleThresholdReached,
@@ -240,6 +288,46 @@ pub async fn run() -> Result<()> {
                     event_sounds.as_ref(),
                     config.completion.sound,
                 ).await;
+                if coop.is_host() {
+                    next_coop_publish = Instant::now();
+                }
+            }
+            Some(event) = coop_event_receiver.recv() => {
+                match coop.accept(event) {
+                    AcceptedEvent::Snapshot(snapshot) => {
+                        let now = clock.sample()?;
+                        let effects = scheduler.adopt_coop_snapshot(&snapshot, now);
+                        apply_effects(
+                            effects,
+                            &mut overlay,
+                            &notifications,
+                            event_sounds.as_ref(),
+                            config.completion.sound,
+                        ).await;
+                    }
+                    AcceptedEvent::ActionRequest { request_id, action } => {
+                        let command = action.into_command();
+                        match execute_command(
+                            &command,
+                            &clock,
+                            &state_store,
+                            &mut scheduler,
+                            &mut config,
+                            &mut overlay,
+                            &notifications,
+                            event_sounds.as_ref(),
+                            &mut coop,
+                            idle_capability,
+                            tray.available(),
+                        ).await {
+                            Ok((message, _)) => tracing::info!(%request_id, %message, "co-op action handled"),
+                            Err(error) => tracing::warn!(%request_id, %error, "co-op action rejected"),
+                        }
+                        next_coop_publish = Instant::now();
+                    }
+                    AcceptedEvent::Error(error) => tracing::warn!(%error, "co-op relay error"),
+                    AcceptedEvent::StateChanged | AcceptedEvent::Stale => {}
+                }
             }
             result = tokio::signal::ctrl_c() => {
                 result?;
@@ -250,6 +338,17 @@ pub async fn run() -> Result<()> {
                 overlay.stop_any().await;
                 break;
             }
+        }
+
+        if coop.is_host() && Instant::now() >= next_coop_publish {
+            let now = clock.sample()?;
+            let (host_id, revision) = coop.next_snapshot_identity();
+            let (snapshot, scheduler_changed) = scheduler.coop_snapshot(host_id, revision, now);
+            if scheduler_changed {
+                state_store.save(&scheduler.snapshot())?;
+            }
+            coop.publish(snapshot);
+            next_coop_publish = Instant::now() + Duration::from_secs(1);
         }
 
         let now = clock.sample()?;
@@ -271,11 +370,22 @@ pub async fn run() -> Result<()> {
 
 fn completion_sound_directory(instance: breakd_config::RuntimeInstance) -> PathBuf {
     match instance {
-        breakd_config::RuntimeInstance::Production => PathBuf::from("/usr/share/breakd"),
+        breakd_config::RuntimeInstance::Production => std::env::current_exe()
+            .ok()
+            .and_then(|executable| installed_data_directory(&executable))
+            .filter(|directory| directory.is_dir())
+            .unwrap_or_else(|| PathBuf::from("/usr/share/breakd")),
         breakd_config::RuntimeInstance::Development => {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../platform-linux/assets")
         }
     }
+}
+
+fn installed_data_directory(executable: &Path) -> Option<PathBuf> {
+    executable
+        .parent()?
+        .parent()
+        .map(|prefix| prefix.join("share/breakd"))
 }
 
 async fn spawn_settings() -> Result<()> {
@@ -305,6 +415,7 @@ async fn handle_request(
     overlay: &mut OverlaySupervisor,
     notifications: &NotificationClient,
     event_sounds: Option<&EventSoundClient>,
+    coop: &mut CoopRuntime,
     idle_capability: IdleCapability,
     tray_available: bool,
 ) -> Response {
@@ -318,6 +429,7 @@ async fn handle_request(
         overlay,
         notifications,
         event_sounds,
+        coop,
         idle_capability,
         tray_available,
     )
@@ -351,10 +463,20 @@ async fn execute_command(
     overlay: &mut OverlaySupervisor,
     notifications: &NotificationClient,
     event_sounds: Option<&EventSoundClient>,
+    coop: &mut CoopRuntime,
     idle_capability: IdleCapability,
     tray_available: bool,
 ) -> Result<(String, Option<serde_json::Value>)> {
     let now = clock.sample()?;
+    if coop.holds_local_schedule()
+        && let Some(action) = CoopAction::from_command(command)
+    {
+        let request_id = coop.request_action(action)?;
+        return Ok((
+            "request sent to co-op host".into(),
+            Some(serde_json::json!({ "request_id": request_id })),
+        ));
+    }
     match command {
         Command::Status => Ok((
             "status".into(),
@@ -419,10 +541,81 @@ async fn execute_command(
             });
             Ok(("doctor report".into(), Some(report)))
         }
+        Command::CoopHost { relay_url } => {
+            let token = uuid::Uuid::new_v4().simple().to_string();
+            let invite = Invite::new(relay_url, &token)?;
+            config.coop = CoopConfig {
+                mode: CoopMode::Host,
+                relay_url: Some(invite.relay_url().into()),
+                room_token: Some(invite.room_token().into()),
+                disconnect_grace: config.coop.disconnect_grace,
+            };
+            breakd_config::save(config)?;
+            coop.reconfigure(config.coop.clone());
+            Ok((
+                "co-op room created".into(),
+                Some(serde_json::json!({
+                    "invite": invite.to_string(),
+                    "status": coop.status_json(),
+                })),
+            ))
+        }
+        Command::CoopJoin { invite } => {
+            let invite = Invite::parse(invite)?;
+            config.coop = CoopConfig {
+                mode: CoopMode::Guest,
+                relay_url: Some(invite.relay_url().into()),
+                room_token: Some(invite.room_token().into()),
+                disconnect_grace: config.coop.disconnect_grace,
+            };
+            breakd_config::save(config)?;
+            coop.reconfigure(config.coop.clone());
+            overlay.stop_any().await;
+            Ok(("joining co-op room".into(), Some(coop.status_json())))
+        }
+        Command::CoopLeave => {
+            let disconnect_grace = config.coop.disconnect_grace;
+            config.coop = CoopConfig {
+                disconnect_grace,
+                ..CoopConfig::default()
+            };
+            breakd_config::save(config)?;
+            coop.reconfigure(config.coop.clone());
+            let effects = scheduler.reset_after_coop_disconnect(now);
+            state_store.save(&scheduler.snapshot())?;
+            apply_effects(
+                effects,
+                overlay,
+                notifications,
+                event_sounds,
+                config.completion.sound,
+            )
+            .await;
+            Ok(("left co-op room; local schedule reset".into(), None))
+        }
+        Command::CoopStatus => Ok(("co-op status".into(), Some(coop.status_json()))),
         Command::Reload => {
             let updated = breakd_config::load()?;
+            let previous_coop = config.coop.clone();
             scheduler.replace_config(updated.clone());
             *config = updated;
+            if config.coop != previous_coop {
+                let was_guest = previous_coop.mode == CoopMode::Guest;
+                coop.reconfigure(config.coop.clone());
+                if config.coop.mode == CoopMode::Guest {
+                    overlay.stop_any().await;
+                } else if was_guest {
+                    let effects = scheduler.reset_after_coop_disconnect(now);
+                    apply_effects(
+                        effects,
+                        overlay,
+                        notifications,
+                        event_sounds,
+                        config.completion.sound,
+                    )
+                    .await;
+                }
+            }
             state_store.save(&scheduler.snapshot())?;
             Ok((
                 "configuration reloaded; restart for idle-monitor or logging changes".into(),
@@ -711,10 +904,30 @@ fn command_message(command: &Command) -> &'static str {
         Command::Long => "long break started",
         Command::Rest => "rest break started",
         Command::Toggle => "schedule toggled",
-        Command::Status | Command::Reload | Command::Outputs | Command::Doctor => "ok",
+        Command::Status
+        | Command::Reload
+        | Command::Outputs
+        | Command::Doctor
+        | Command::CoopHost { .. }
+        | Command::CoopJoin { .. }
+        | Command::CoopLeave
+        | Command::CoopStatus => "ok",
     }
 }
 
 pub fn socket_exists(path: &Path) -> bool {
     path.exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_data_directory_follows_the_executable_prefix() {
+        assert_eq!(
+            installed_data_directory(Path::new("/nix/store/hash-breakd/bin/breakd")),
+            Some(PathBuf::from("/nix/store/hash-breakd/share/breakd"))
+        );
+    }
 }
