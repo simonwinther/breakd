@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.10](https://github.com/simonwinther/breakd/compare/v0.1.9...v0.1.10) (2026-07-15)
+
+
+### Features
+
+* add co-op synchronization and NixOS delivery ([8451991](https://github.com/simonwinther/breakd/commit/8451991d8047f80ca8e60f46a15e94702e25d164))
+* add co-op synchronization and NixOS delivery ([d670c47](https://github.com/simonwinther/breakd/commit/d670c47e18e64f5a3575492063956b34ddac9ffe))
+
 ## [0.1.9](https://github.com/simonwinther/breakd/compare/v0.1.8...v0.1.9) (2026-07-15)
 
 
