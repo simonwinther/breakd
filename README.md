@@ -52,8 +52,8 @@ systemctl --user restart breakd.service
 Set `strict.mode` to one of these values:
 
 - `off`: skip and postpone are available immediately.
-- `delay`: controls unlock after `strict.minimum_visible`.
-- `entire`: the break cannot be skipped.
+- `delay`: skip and postpone are still available immediately; `strict.minimum_visible` only delays the pause and reset loopholes.
+- `entire`: skip and postpone are locked for the whole break (`allow_postpone_during_lockout` still permits postponing).
 
 Set `strict.inhibit_shortcuts = true` to request standard Wayland shortcut inhibition while the overlay is active. With `hyprland.submap_fallback = true`, the daemon also enters a temporary Hyprland `breakd` submap because layer surfaces do not reliably suppress compositor bindings on every Hyprland version. The submap is registered at runtime, checked throughout the break, and reset when the break or daemon exits.
 
