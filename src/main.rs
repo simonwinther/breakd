@@ -53,12 +53,36 @@ enum CliCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Host, join, or inspect a synchronized co-op room.
+    Coop {
+        #[command(subcommand)]
+        command: CoopCommand,
+    },
     /// Open the graphical configuration window.
     Settings,
     #[command(hide = true)]
     Overlay,
     /// Print the default TOML configuration.
     ExampleConfig,
+}
+
+#[derive(Debug, Subcommand)]
+enum CoopCommand {
+    /// Create a room and print a secret invite.
+    Host {
+        /// Public ws:// or wss:// relay endpoint.
+        #[arg(long)]
+        relay: String,
+    },
+    /// Join a room using the invite printed by its host.
+    Join { invite: String },
+    /// Disconnect and return to a fresh local schedule.
+    Leave,
+    /// Show relay connection and room state.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -101,6 +125,14 @@ async fn execute(arguments: Arguments) -> Result<()> {
         CliCommand::Reload => send(Command::Reload, false).await,
         CliCommand::Outputs { json } => send(Command::Outputs, json).await,
         CliCommand::Doctor { json } => send(Command::Doctor, json).await,
+        CliCommand::Coop { command } => match command {
+            CoopCommand::Host { relay } => {
+                send(Command::CoopHost { relay_url: relay }, false).await
+            }
+            CoopCommand::Join { invite } => send(Command::CoopJoin { invite }, false).await,
+            CoopCommand::Leave => send(Command::CoopLeave, false).await,
+            CoopCommand::Status { json } => send(Command::CoopStatus, json).await,
+        },
         CliCommand::Settings => breakd_settings::run().map_err(anyhow::Error::msg),
     }
 }

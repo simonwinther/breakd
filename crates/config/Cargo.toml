@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+breakd-coop = { path = "../coop" }
 breakd-core = { path = "../core" }
 nix.workspace = true
 tempfile.workspace = true

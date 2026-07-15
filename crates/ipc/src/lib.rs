@@ -15,7 +15,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-pub const IPC_VERSION: u32 = 1;
+pub const IPC_VERSION: u32 = 2;
 const MAX_FRAME_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Error)]

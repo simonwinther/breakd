@@ -343,6 +343,38 @@ impl Default for TrayConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoopMode {
+    #[default]
+    Off,
+    Host,
+    Guest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoopConfig {
+    #[serde(default)]
+    pub mode: CoopMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_token: Option<String>,
+    #[serde(default = "default_coop_disconnect_grace")]
+    pub disconnect_grace: DurationMs,
+}
+
+impl Default for CoopConfig {
+    fn default() -> Self {
+        Self {
+            mode: CoopMode::Off,
+            relay_url: None,
+            room_token: None,
+            disconnect_grace: default_coop_disconnect_grace(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub schema_version: u32,
@@ -363,6 +395,8 @@ pub struct AppConfig {
     pub hyprland: HyprlandConfig,
     #[serde(default)]
     pub tray: TrayConfig,
+    #[serde(default)]
+    pub coop: CoopConfig,
     pub logging: LoggingConfig,
 }
 
@@ -380,6 +414,10 @@ fn default_rest_postpone() -> PostponeRule {
         duration: DurationMs::from_millis(10 * 60 * 1_000),
         max_postponements: None,
     }
+}
+
+const fn default_coop_disconnect_grace() -> DurationMs {
+    DurationMs::from_millis(10_000)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,6 +532,10 @@ pub enum Command {
     Reload,
     Outputs,
     Doctor,
+    CoopHost { relay_url: String },
+    CoopJoin { invite: String },
+    CoopLeave,
+    CoopStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

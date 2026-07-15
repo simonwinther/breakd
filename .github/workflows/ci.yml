@@ -32,3 +32,16 @@ jobs:
 
       - name: Build release binary
         run: cargo build --locked --release --workspace
+
+  nixos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Check Nix formatting
+        run: nix fmt -- --check flake.nix packaging/nix/*.nix
+
+      - name: Check and build Nix packages
+        run: nix flake check --print-build-logs
