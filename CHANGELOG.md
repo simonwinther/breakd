@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.9](https://github.com/simonwinther/breakd/compare/v0.1.8...v0.1.9) (2026-07-15)
+
+
+### Bug Fixes
+
+* **scheduler:** allow skip and postpone immediately in delay mode ([c25956f](https://github.com/simonwinther/breakd/commit/c25956f8e59e7faf34658cd19f655213a44370c5))
+* **wayland-overlay:** keep the break overlay alive when outputs disappear ([9b012cc](https://github.com/simonwinther/breakd/commit/9b012cc066b39bb6001e7a83dae1d3a945049171))
+
 ## [0.1.8](https://github.com/simonwinther/breakd/compare/v0.1.7...v0.1.8) (2026-07-14)
 
 
