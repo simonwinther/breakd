@@ -173,6 +173,7 @@ version = "0.1.11"
 dependencies = [
  "breakd-core",
  "serde",
+ "serde_json",
  "thiserror",
  "uuid",
 ]
@@ -281,8 +282,12 @@ version = "0.1.11"
 dependencies = [
  "breakd-config",
  "breakd-core",
+ "breakd-ipc",
  "glib",
  "gtk4",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

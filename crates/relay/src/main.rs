@@ -413,7 +413,7 @@ fn init_logging() {
 
 #[cfg(test)]
 mod tests {
-    use breakd_coop::{CoopAction, CoopPhase, CoopSnapshot, ScheduledBreak};
+    use breakd_coop::{CoopAction, CoopPhase, CoopPolicy, CoopSnapshot, ScheduledBreak};
     use breakd_core::{BreakKind, DueBreakId};
 
     use super::*;
@@ -526,6 +526,14 @@ mod tests {
             postpone_count: 0,
             can_skip: false,
             can_postpone: false,
+            policy: Some(CoopPolicy {
+                notifications_enabled: true,
+                mini_notification_lead_ms: 20_000,
+                long_notification_lead_ms: 40_000,
+                rest_notification_lead_ms: 60_000,
+                allow_postpone_during_lockout: true,
+                inhibit_shortcuts: true,
+            }),
         };
         route_message(
             &rooms,

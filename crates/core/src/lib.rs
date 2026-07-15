@@ -563,6 +563,10 @@ pub struct OverlaySpec {
     pub can_skip: bool,
     pub can_postpone: bool,
     pub manual_resume: bool,
+    #[serde(default)]
+    pub allow_postpone_during_lockout: bool,
+    #[serde(default)]
+    pub inhibit_shortcuts: bool,
     pub message: Option<String>,
     pub socket_path: String,
 }

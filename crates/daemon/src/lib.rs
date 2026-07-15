@@ -129,7 +129,11 @@ pub async fn run() -> Result<()> {
     let mut shortcut_guard = HyprlandShortcutGuard::new(instance.hyprland_submap());
     shortcut_guard.initialize(&config).await;
     shortcut_guard
-        .reconcile(&config, &scheduler.status(now))
+        .reconcile(
+            &config,
+            scheduler.shortcut_inhibition_enabled(),
+            &scheduler.status(now),
+        )
         .await;
 
     let mut ticker = interval(Duration::from_millis(250));
@@ -222,6 +226,7 @@ pub async fn run() -> Result<()> {
                     TrayAction::Command(command) => {
                         match execute_command(
                             &command,
+                            CommandOrigin::Local,
                             &clock,
                             &state_store,
                             &mut scheduler,
@@ -313,6 +318,7 @@ pub async fn run() -> Result<()> {
                         let command = action.into_command();
                         match execute_command(
                             &command,
+                            CommandOrigin::CoopGuest,
                             &clock,
                             &state_store,
                             &mut scheduler,
@@ -366,7 +372,9 @@ pub async fn run() -> Result<()> {
         } else if tray_enabled {
             tray.update(next_tray_state).await;
         }
-        shortcut_guard.reconcile(&config, &status).await;
+        shortcut_guard
+            .reconcile(&config, scheduler.shortcut_inhibition_enabled(), &status)
+            .await;
     }
     shortcut_guard.release().await;
     Ok(())
@@ -426,6 +434,7 @@ async fn handle_request(
     let request_id = incoming.request.request_id;
     let result = execute_command(
         &incoming.request.command,
+        CommandOrigin::Local,
         clock,
         state_store,
         scheduler,
@@ -457,9 +466,16 @@ async fn handle_request(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandOrigin {
+    Local,
+    CoopGuest,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_command(
     command: &Command,
+    origin: CommandOrigin,
     clock: &LinuxClock,
     state_store: &StateStore,
     scheduler: &mut Scheduler,
@@ -628,8 +644,12 @@ async fn execute_command(
         }
         command => {
             let previous = scheduler.state().clone();
-            let effects = scheduler
-                .handle_command(command, now)
+            let effects =
+                if origin == CommandOrigin::CoopGuest && matches!(command, Command::ResumeBreak) {
+                    scheduler.handle_coop_resume_request(now)
+                } else {
+                    scheduler.handle_command(command, now)
+                }
                 .map_err(anyhow::Error::from)?;
             persist_if_changed(state_store, scheduler, &previous)?;
             apply_effects(
@@ -685,7 +705,7 @@ impl HyprlandShortcutGuard {
     }
 
     async fn initialize(&mut self, config: &breakd_core::AppConfig) {
-        if !submap_fallback_enabled(config) {
+        if !submap_fallback_available(config) {
             return;
         }
         let Some(client) = &self.client else {
@@ -702,8 +722,14 @@ impl HyprlandShortcutGuard {
         }
     }
 
-    async fn reconcile(&mut self, config: &breakd_core::AppConfig, status: &SchedulerStatus) {
-        let should_block = submap_fallback_enabled(config)
+    async fn reconcile(
+        &mut self,
+        config: &breakd_core::AppConfig,
+        inhibit_shortcuts: bool,
+        status: &SchedulerStatus,
+    ) {
+        let should_block = submap_fallback_available(config)
+            && inhibit_shortcuts
             && matches!(
                 status.state.as_str(),
                 "mini-break" | "long-break" | "rest-break"
@@ -783,11 +809,8 @@ impl HyprlandShortcutGuard {
     }
 }
 
-fn submap_fallback_enabled(config: &breakd_core::AppConfig) -> bool {
-    config.hyprland.enabled
-        && config.hyprland.submap_fallback
-        && config.strict.mode != breakd_core::StrictMode::Off
-        && config.strict.inhibit_shortcuts
+fn submap_fallback_available(config: &breakd_core::AppConfig) -> bool {
+    config.hyprland.enabled && config.hyprland.submap_fallback
 }
 
 fn persist_if_changed(

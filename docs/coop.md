@@ -87,6 +87,12 @@ Run `breakd coop host` again to make a new token and invalidate the previous roo
 from that host. `breakd coop leave` clears the relay URL and token and resets a
 fresh local schedule.
 
+The same lifecycle is available under the **Collaboration** tab in
+`breakd settings`. The host form accepts either a complete WebSocket URL or a
+Tailscale MagicDNS name with a port, and the join form accepts the complete
+invite. Hosting creates a new token, so clicking it again rotates the room just
+like the CLI command.
+
 `breakd coop host` waits until the host is connected before printing its final
 status. `breakd coop join` waits for the first authoritative host snapshot, so a
 successful return means `connected`, `host_present`, and `following_host` are all
@@ -97,16 +103,20 @@ background and `breakd coop status` shows its latest state and error.
 
 The host publishes at most one regular snapshot per second and immediately after
 local or guest-requested actions. A working snapshot includes the next break's
-absolute Unix start time, duration, type, stable due ID, and strict/manual-resume
-policy. That lets both schedulers start the same session locally without waiting
-for a round trip at the deadline. Active-break and pause snapshots let a guest
-join midway through a room.
+absolute Unix start time, duration, type, stable due ID, strict/manual-resume
+policy, and notification policy. That lets both schedulers start the same
+session locally without waiting for a round trip at the deadline. Active-break
+and pause snapshots let a guest join midway through a room.
 
-Guests use their own display, content, sound, and monitor configuration. They do
-not run idle, lock, or suspend transitions while following the host. Native
-WebSocket ping frames keep the one connection alive, and reconnects use bounded
-exponential backoff. The client rejects stale revisions and messages larger than
-128 KiB.
+The host owns settings that must agree across participants: cadence, break
+duration and kind, pause state, strict/skip/postpone rules, manual resume, and
+notification enablement and lead times. Manual-resume input from any participant
+is validated by the host and completes the break for the room. Guests use their
+own display, content, opacity, pointer, sound, tray, and monitor configuration.
+They do not run idle, lock, or suspend transitions while following the host.
+Native WebSocket ping frames keep the one connection alive, and reconnects use
+bounded exponential backoff. The client rejects stale revisions and messages
+larger than 128 KiB.
 
 When the configured `coop.disconnect_grace` elapses without a snapshot (10
 seconds by default), a guest discards the mirrored state and begins a fresh local
