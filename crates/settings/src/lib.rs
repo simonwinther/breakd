@@ -1,17 +1,22 @@
 use std::{
     cell::{Cell, RefCell},
-    process::Command,
+    process::Command as ProcessCommand,
     rc::Rc,
+    sync::{Mutex, OnceLock},
+    time::Duration,
 };
 
 use breakd_core::{
-    AppConfig, CompletionSound, ContentSelector, DisplayMode, DurationMs, PointerMode, StrictMode,
+    AppConfig, Command, CompletionSound, ContentSelector, DisplayMode, DurationMs, PointerMode,
+    StrictMode,
 };
 use gtk::{gio, prelude::*};
 use gtk4 as gtk;
+use serde::Deserialize;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES_URL: &str = "https://github.com/simonwinther/breakd/releases/latest";
+static IPC_RUNTIME: OnceLock<Result<Mutex<tokio::runtime::Runtime>, String>> = OnceLock::new();
 
 pub fn run() -> Result<(), String> {
     let instance = breakd_config::RuntimeInstance::current();
@@ -88,6 +93,43 @@ struct PostponeWidgets {
     maximum: gtk::SpinButton,
 }
 
+#[derive(Clone)]
+struct CollaborationControls {
+    page: gtk::ScrolledWindow,
+    relay_entry: gtk::Entry,
+    join_entry: gtk::Entry,
+    invite_output: gtk::Entry,
+    role_value: gtk::Label,
+    connection_value: gtk::Label,
+    participants_value: gtk::Label,
+    relay_value: gtk::Label,
+    error_value: gtk::Label,
+    host_button: gtk::Button,
+    join_button: gtk::Button,
+    leave_button: gtk::Button,
+    copy_button: gtk::Button,
+    busy: Rc<Cell<bool>>,
+    refreshing: Rc<Cell<bool>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoopUiStatus {
+    mode: String,
+    relay_url: Option<String>,
+    connected: bool,
+    host_present: bool,
+    guest_count: usize,
+    following_host: bool,
+    last_error: Option<String>,
+    invite: Option<String>,
+}
+
+enum CoopUiAction {
+    Host(String),
+    Join(String),
+    Leave,
+}
+
 impl SettingsWidgets {
     fn collect(&self, base: &AppConfig) -> Result<AppConfig, String> {
         let mut config = base.clone();
@@ -160,6 +202,7 @@ fn build_window(
     let (schedule_page, schedule_widgets) = schedule_page(&initial);
     let (actions_page, action_widgets) = actions_page(&initial);
     let (desktop_page, desktop_widgets) = desktop_page(&initial);
+    let collaboration = collaboration_page(&initial);
     let widgets = SettingsWidgets {
         mini_interval: schedule_widgets.0,
         mini_duration: schedule_widgets.1,
@@ -203,6 +246,7 @@ fn build_window(
     stack.add_titled(&schedule_page, Some("schedule"), "Schedule");
     stack.add_titled(&actions_page, Some("actions"), "Actions");
     stack.add_titled(&desktop_page, Some("desktop"), "Desktop");
+    stack.add_titled(&collaboration.page, Some("collaboration"), "Collaboration");
     stack.set_visible_child_name("schedule");
 
     let switcher = gtk::StackSwitcher::builder()
@@ -238,6 +282,7 @@ fn build_window(
     status_bar.add_css_class("settings-status-bar");
     status_bar.append(&status);
     status_bar.append(&version_corner());
+    collaboration.connect(status.clone());
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.append(&introduction);
@@ -265,7 +310,7 @@ fn build_window(
 
     let state_for_save = state.clone();
     save.connect_clicked(move |button| {
-        let current = state_for_save.borrow().clone();
+        let current = breakd_config::load().unwrap_or_else(|_| state_for_save.borrow().clone());
         let config = match widgets.collect(&current) {
             Ok(config) => config,
             Err(error) => {
@@ -777,6 +822,396 @@ fn desktop_page(config: &AppConfig) -> (gtk::ScrolledWindow, DesktopPageWidgets)
     )
 }
 
+fn collaboration_page(config: &AppConfig) -> CollaborationControls {
+    let role_value = collaboration_value_label();
+    let connection_value = collaboration_value_label();
+    let participants_value = collaboration_value_label();
+    let relay_value = collaboration_value_label();
+    let error_value = gtk::Label::new(None);
+    error_value.set_halign(gtk::Align::Start);
+    error_value.set_wrap(true);
+    error_value.set_visible(false);
+    error_value.add_css_class("settings-error");
+    let status_group = settings_group(
+        "Room status",
+        "Connection state is refreshed from the running breakd daemon.",
+        &[
+            settings_row("Role", "Your role in the current room.", &role_value),
+            settings_row(
+                "Connection",
+                "Whether schedule snapshots are flowing.",
+                &connection_value,
+            ),
+            settings_row(
+                "Participants",
+                "Guests connected to the host room.",
+                &participants_value,
+            ),
+            settings_row("Relay", "The active WebSocket relay.", &relay_value),
+        ],
+    );
+    status_group.append(&error_value);
+
+    let relay_entry = gtk::Entry::builder()
+        .text(config.coop.relay_url.as_deref().unwrap_or_default())
+        .placeholder_text("lambda-1.example.ts.net:8787")
+        .width_chars(30)
+        .max_width_chars(48)
+        .build();
+    relay_entry.set_tooltip_text(Some(
+        "A Tailscale DNS name or complete ws:// / wss:// relay URL",
+    ));
+    let host_button = gtk::Button::with_label("Host new room");
+    host_button.add_css_class("suggested-action");
+    let invite_output = gtk::Entry::builder()
+        .editable(false)
+        .placeholder_text("Your invite appears here")
+        .width_chars(30)
+        .max_width_chars(48)
+        .build();
+    invite_output.add_css_class("settings-secret");
+    let copy_button = gtk::Button::with_label("Copy invite");
+    copy_button.set_sensitive(false);
+    let invite_controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    invite_controls.append(&invite_output);
+    invite_controls.append(&copy_button);
+    let host_group = settings_group(
+        "Host a room",
+        "Use your host's Tailscale MagicDNS name so every shared user reaches the correct address. The relay must already be listening on that port.",
+        &[
+            settings_row(
+                "Relay address",
+                "A DNS name with port, or a complete WebSocket URL.",
+                &relay_entry,
+            ),
+            settings_row(
+                "Create or rotate room",
+                "Generates a new secret invite and invalidates this host's previous room.",
+                &host_button,
+            ),
+            settings_row(
+                "Invite",
+                "Share this complete value privately with your collaborators.",
+                &invite_controls,
+            ),
+        ],
+    );
+
+    let join_entry = gtk::Entry::builder()
+        .placeholder_text("ws://host:8787/ws#breakd=...")
+        .width_chars(30)
+        .max_width_chars(48)
+        .build();
+    join_entry.add_css_class("settings-secret");
+    let join_button = gtk::Button::with_label("Join room");
+    join_button.add_css_class("suggested-action");
+    let join_group = settings_group(
+        "Join a room",
+        "Paste the complete invite sent by the host. Do not open it in a browser.",
+        &[
+            settings_row(
+                "Room invite",
+                "Includes the relay URL and secret room token.",
+                &join_entry,
+            ),
+            settings_row(
+                "Follow host",
+                "Adopt the host's schedule and coordination policy.",
+                &join_button,
+            ),
+        ],
+    );
+
+    let leave_button = gtk::Button::with_label("Leave room");
+    leave_button.add_css_class("destructive-action");
+    leave_button.set_sensitive(config.coop.mode != breakd_core::CoopMode::Off);
+    let leave_group = settings_group(
+        "Leave collaboration",
+        "Leaving clears the room secret and starts a fresh local schedule.",
+        &[settings_row(
+            "Disconnect",
+            "Stop hosting or following the current room.",
+            &leave_button,
+        )],
+    );
+
+    CollaborationControls {
+        page: settings_page(&[status_group, host_group, join_group, leave_group]),
+        relay_entry,
+        join_entry,
+        invite_output,
+        role_value,
+        connection_value,
+        participants_value,
+        relay_value,
+        error_value,
+        host_button,
+        join_button,
+        leave_button,
+        copy_button,
+        busy: Rc::new(Cell::new(false)),
+        refreshing: Rc::new(Cell::new(false)),
+    }
+}
+
+fn collaboration_value_label() -> gtk::Label {
+    let label = gtk::Label::new(Some("—"));
+    label.set_halign(gtk::Align::End);
+    label.set_wrap(true);
+    label.set_width_chars(22);
+    label.set_max_width_chars(32);
+    label.set_xalign(1.0);
+    label.set_selectable(true);
+    label
+}
+
+impl CollaborationControls {
+    fn connect(&self, settings_status: gtk::Label) {
+        let controls = self.clone();
+        let status = settings_status.clone();
+        self.host_button.connect_clicked(move |_| {
+            controls.run_action(
+                CoopUiAction::Host(controls.relay_entry.text().to_string()),
+                status.clone(),
+            );
+        });
+
+        let controls = self.clone();
+        let status = settings_status.clone();
+        self.join_button.connect_clicked(move |_| {
+            controls.run_action(
+                CoopUiAction::Join(controls.join_entry.text().to_string()),
+                status.clone(),
+            );
+        });
+
+        let controls = self.clone();
+        let status = settings_status.clone();
+        self.join_entry.connect_activate(move |_| {
+            controls.run_action(
+                CoopUiAction::Join(controls.join_entry.text().to_string()),
+                status.clone(),
+            );
+        });
+
+        let controls = self.clone();
+        let status = settings_status.clone();
+        self.leave_button.connect_clicked(move |_| {
+            controls.run_action(CoopUiAction::Leave, status.clone());
+        });
+
+        let invite = self.invite_output.clone();
+        let status = settings_status.clone();
+        self.copy_button.connect_clicked(move |_| {
+            if invite.text().is_empty() {
+                return;
+            }
+            if let Some(display) = gtk::gdk::Display::default() {
+                display.clipboard().set_text(&invite.text());
+                set_status(&status, "Co-op invite copied to the clipboard.", false);
+            }
+        });
+
+        self.refresh();
+        let controls = self.clone();
+        glib::timeout_add_seconds_local(1, move || {
+            controls.refresh();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    fn run_action(&self, action: CoopUiAction, settings_status: gtk::Label) {
+        if self.busy.replace(true) {
+            return;
+        }
+        self.set_action_buttons(false);
+        self.set_local_error(None);
+        set_status(&settings_status, "Updating co-op room...", false);
+
+        let controls = self.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || perform_coop_action(action)).await;
+            controls.busy.set(false);
+            match result {
+                Ok(Ok(status)) => {
+                    controls.apply_status(&status);
+                    set_status(
+                        &settings_status,
+                        match (
+                            status.mode.as_str(),
+                            status.connected,
+                            status.following_host,
+                        ) {
+                            ("host", true, _) => "Co-op room is hosted and ready.",
+                            ("host", false, _) => "Room created; connecting to the co-op relay.",
+                            ("guest", _, true) => "Joined the co-op room and following its host.",
+                            ("guest", _, false) => "Invite saved; connecting to the co-op host.",
+                            _ => "Left the co-op room; local schedule reset.",
+                        },
+                        false,
+                    );
+                }
+                Ok(Err(error)) => {
+                    controls.set_action_buttons(true);
+                    controls.set_local_error(Some(&error));
+                    set_status(&settings_status, &error, true);
+                }
+                Err(_) => {
+                    controls.set_action_buttons(true);
+                    controls.set_local_error(Some("Co-op action failed unexpectedly."));
+                    set_status(&settings_status, "Co-op action failed unexpectedly.", true);
+                }
+            }
+        });
+    }
+
+    fn refresh(&self) {
+        if self.busy.get() || self.refreshing.replace(true) {
+            return;
+        }
+        let controls = self.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(load_coop_status).await;
+            controls.refreshing.set(false);
+            match result {
+                Ok(Ok(status)) => controls.apply_status(&status),
+                Ok(Err(error)) => controls.set_local_error(Some(&error)),
+                Err(_) => controls.set_local_error(Some("Could not read co-op status.")),
+            }
+        });
+    }
+
+    fn apply_status(&self, status: &CoopUiStatus) {
+        self.role_value.set_text(match status.mode.as_str() {
+            "host" => "Host",
+            "guest" => "Guest",
+            _ => "Local only",
+        });
+        self.connection_value.set_text(match status.mode.as_str() {
+            "host" if status.connected => "Relay connected",
+            "host" => "Connecting to relay…",
+            "guest" if status.following_host => "Following host schedule",
+            "guest" if status.connected && status.host_present => "Waiting for first snapshot…",
+            "guest" if status.connected => "Waiting for host…",
+            "guest" => "Connecting to relay…",
+            _ => "Not in a room",
+        });
+        let participants = match status.mode.as_str() {
+            "host" => format!(
+                "{} connected guest{}",
+                status.guest_count,
+                if status.guest_count == 1 { "" } else { "s" }
+            ),
+            "guest" if status.host_present => "Host is present".into(),
+            "guest" => "Host is unavailable".into(),
+            _ => "—".into(),
+        };
+        self.participants_value.set_text(&participants);
+        self.relay_value
+            .set_text(status.relay_url.as_deref().unwrap_or("—"));
+        self.invite_output
+            .set_text(status.invite.as_deref().unwrap_or_default());
+        self.copy_button.set_sensitive(
+            status
+                .invite
+                .as_ref()
+                .is_some_and(|invite| !invite.is_empty()),
+        );
+        self.leave_button.set_sensitive(status.mode != "off");
+        self.set_action_buttons(true);
+        self.set_local_error(status.last_error.as_deref());
+    }
+
+    fn set_action_buttons(&self, enabled: bool) {
+        self.host_button.set_sensitive(enabled);
+        self.join_button.set_sensitive(enabled);
+        if !enabled {
+            self.leave_button.set_sensitive(false);
+            self.copy_button.set_sensitive(false);
+        }
+    }
+
+    fn set_local_error(&self, error: Option<&str>) {
+        self.error_value.set_text(error.unwrap_or_default());
+        self.error_value
+            .set_visible(error.is_some_and(|error| !error.is_empty()));
+    }
+}
+
+fn perform_coop_action(action: CoopUiAction) -> Result<CoopUiStatus, String> {
+    let command = match action {
+        CoopUiAction::Host(input) => {
+            let relay = normalize_relay_input(&input)?;
+            Command::CoopHost { relay_url: relay }
+        }
+        CoopUiAction::Join(invite) => {
+            let invite = invite.trim();
+            if invite.is_empty() {
+                return Err("Paste a complete co-op invite before joining.".into());
+            }
+            Command::CoopJoin {
+                invite: invite.to_owned(),
+            }
+        }
+        CoopUiAction::Leave => Command::CoopLeave,
+    };
+    request_daemon(command)?;
+    load_coop_status()
+}
+
+fn load_coop_status() -> Result<CoopUiStatus, String> {
+    serde_json::from_value(request_daemon(Command::CoopStatus)?)
+        .map_err(|error| format!("Invalid co-op status: {error}"))
+}
+
+fn request_daemon(command: Command) -> Result<serde_json::Value, String> {
+    let runtime = IPC_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(Mutex::new)
+            .map_err(|error| format!("Could not initialize co-op IPC: {error}"))
+    });
+    let runtime = runtime.as_ref().map_err(Clone::clone)?;
+    let runtime = runtime
+        .lock()
+        .map_err(|_| "Co-op IPC became unavailable.".to_owned())?;
+    let response = runtime
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                breakd_ipc::request(breakd_config::socket_path(), command),
+            )
+            .await
+        })
+        .map_err(|_| "The breakd daemon response timed out.".to_owned())?
+        .map_err(|error| format!("Could not contact the breakd daemon: {error}"))?;
+    if !response.ok {
+        return Err(response.message);
+    }
+    Ok(response.data.unwrap_or(serde_json::Value::Null))
+}
+
+fn normalize_relay_input(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("Enter a Tailscale DNS name, IP address, or relay URL.".into());
+    }
+    if input.contains('#') {
+        return Err("Enter the relay address without a room-invite fragment.".into());
+    }
+    let mut relay = if input.starts_with("ws://") || input.starts_with("wss://") {
+        input.to_owned()
+    } else {
+        format!("ws://{input}")
+    };
+    let authority_start = relay.find("://").map_or(0, |index| index + 3);
+    if !relay[authority_start..].contains('/') {
+        relay.push_str("/ws");
+    }
+    Ok(relay)
+}
+
 fn version_corner() -> gtk::Box {
     let corner = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     corner.set_halign(gtk::Align::End);
@@ -803,7 +1238,7 @@ fn version_corner() -> gtk::Box {
 }
 
 fn fetch_latest_release_tag() -> Option<String> {
-    let output = Command::new("curl")
+    let output = ProcessCommand::new("curl")
         .args([
             "-fsSL",
             "--max-time",
@@ -1150,7 +1585,7 @@ fn save_and_reload(config: &AppConfig, restart_required: bool) -> Result<String,
     let executable = std::env::current_exe().map_err(|error| {
         format!("Configuration was saved, but breakd could not reload: {error}")
     })?;
-    let output = Command::new(executable)
+    let output = ProcessCommand::new(executable)
         .arg("reload")
         .output()
         .map_err(|error| {
@@ -1310,6 +1745,9 @@ fn install_css() {
             padding: 0;
             min-height: 0;
         }
+        .settings-secret {
+            font-family: monospace;
+        }
         "#,
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -1324,6 +1762,19 @@ fn install_css() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tailscale_hostnames_become_relay_urls() {
+        assert_eq!(
+            normalize_relay_input("lambda-1.example.ts.net:8787").unwrap(),
+            "ws://lambda-1.example.ts.net:8787/ws"
+        );
+        assert_eq!(
+            normalize_relay_input("wss://breaks.example.net/custom").unwrap(),
+            "wss://breaks.example.net/custom"
+        );
+        assert!(normalize_relay_input("ws://host/ws#breakd=secret").is_err());
+    }
 
     #[test]
     #[ignore = "requires a display server"]

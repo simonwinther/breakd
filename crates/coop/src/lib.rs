@@ -86,6 +86,21 @@ pub struct CoopSnapshot {
     pub postpone_count: u32,
     pub can_skip: bool,
     pub can_postpone: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CoopPolicy>,
+}
+
+/// Host-owned behavior that affects when or how every participant takes a
+/// break. Presentation-only settings such as monitor selection, colors,
+/// opacity, messages, and completion sounds intentionally stay local.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoopPolicy {
+    pub notifications_enabled: bool,
+    pub mini_notification_lead_ms: u64,
+    pub long_notification_lead_ms: u64,
+    pub rest_notification_lead_ms: u64,
+    pub allow_postpone_during_lockout: bool,
+    pub inhibit_shortcuts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,5 +312,37 @@ mod tests {
             command
         );
         assert!(CoopAction::from_command(&Command::Status).is_none());
+        assert_eq!(
+            CoopAction::from_command(&Command::ResumeBreak)
+                .unwrap()
+                .into_command(),
+            Command::ResumeBreak
+        );
+    }
+
+    #[test]
+    fn snapshots_without_the_optional_policy_remain_compatible() {
+        let snapshot = CoopSnapshot {
+            host_id: Uuid::nil(),
+            revision: 1,
+            generated_unix_ms: 10,
+            paused: false,
+            resume_at_unix_ms: None,
+            phase: CoopPhase::Unavailable {
+                reason: "test".into(),
+            },
+            minis_since_long: 0,
+            longs_since_rest: 0,
+            postpone_count: 0,
+            can_skip: false,
+            can_postpone: false,
+            policy: None,
+        };
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert!(encoded.get("policy").is_none());
+        assert_eq!(
+            serde_json::from_value::<CoopSnapshot>(encoded).unwrap(),
+            snapshot
+        );
     }
 }

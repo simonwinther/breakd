@@ -8,7 +8,7 @@ use std::{
 
 use breakd_core::{
     AppConfig, ContentSelector, DisplayMode, KeyboardMode, Layer, OutputInfo, OverlaySpec,
-    PointerMode, StrictMode,
+    PointerMode,
 };
 use breakd_platform_linux::HyprlandClient;
 use gtk::{gdk, gio, prelude::*};
@@ -208,10 +208,7 @@ impl OverlayManager {
         for edge in [Edge::Top, Edge::Right, Edge::Bottom, Edge::Left] {
             window.set_anchor(edge, true);
         }
-        let inhibit_shortcuts = content
-            && input_owner
-            && self.config.strict.mode != StrictMode::Off
-            && self.config.strict.inhibit_shortcuts;
+        let inhibit_shortcuts = content && input_owner && self.spec.inhibit_shortcuts;
         window.set_keyboard_mode(if inhibit_shortcuts {
             LayerKeyboardMode::Exclusive
         } else if content && input_owner {
@@ -225,7 +222,8 @@ impl OverlayManager {
         });
 
         let (panel, countdown, resume_prompt, skip, postpone) = if content {
-            let widgets = build_content(&window, &self.spec);
+            let geometry = monitor.geometry();
+            let widgets = build_content(&window, &self.spec, geometry.width(), geometry.height());
             (
                 Some(widgets.0),
                 Some(widgets.1),
@@ -242,8 +240,7 @@ impl OverlayManager {
             button.set_sensitive(strict_complete);
         }
         if let Some(button) = &postpone {
-            button
-                .set_sensitive(strict_complete || self.config.strict.allow_postpone_during_lockout);
+            button.set_sensitive(strict_complete || self.spec.allow_postpone_during_lockout);
         }
         if content && input_owner {
             configure_action_keys(&window, skip.as_ref(), postpone.as_ref());
@@ -288,9 +285,7 @@ impl OverlayManager {
                 button.set_sensitive(strict_complete);
             }
             if let Some(button) = &surface.postpone {
-                button.set_sensitive(
-                    strict_complete || self.config.strict.allow_postpone_during_lockout,
-                );
+                button.set_sensitive(strict_complete || self.spec.allow_postpone_during_lockout);
             }
             if enter_manual_resume {
                 surface.enter_manual_resume(self.resume_phase.clone());
@@ -323,6 +318,8 @@ impl SurfaceWidgets {
 fn build_content(
     window: &gtk::ApplicationWindow,
     spec: &OverlaySpec,
+    monitor_width: i32,
+    monitor_height: i32,
 ) -> (
     gtk::Box,
     gtk::Label,
@@ -330,17 +327,24 @@ fn build_content(
     Option<gtk::Button>,
     Option<gtk::Button>,
 ) {
+    let layout = panel_layout(monitor_width, monitor_height);
     let panel = gtk::Box::new(gtk::Orientation::Vertical, 18);
     panel.set_halign(gtk::Align::Center);
     panel.set_valign(gtk::Align::Center);
-    panel.set_width_request(560);
+    panel.set_width_request(layout.content_width);
     panel.add_css_class("breakd-panel");
+    if layout.compact {
+        panel.add_css_class("breakd-panel-compact");
+    }
 
     let title = gtk::Label::new(Some(match spec.kind {
         breakd_core::BreakKind::Mini => "Mini break",
         breakd_core::BreakKind::Long => "Long break",
         breakd_core::BreakKind::Rest => "Rest break",
     }));
+    title.set_wrap(true);
+    title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    title.set_justify(gtk::Justification::Center);
     title.add_css_class("breakd-title");
     panel.append(&title);
 
@@ -350,18 +354,31 @@ fn build_content(
 
     let resume_prompt = gtk::Label::new(Some("Press any key or click to continue"));
     resume_prompt.set_visible(false);
+    resume_prompt.set_wrap(true);
+    resume_prompt.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    resume_prompt.set_justify(gtk::Justification::Center);
     resume_prompt.add_css_class("breakd-resume");
     panel.append(&resume_prompt);
 
     if let Some(message) = &spec.message {
         let message_label = gtk::Label::new(Some(message));
         message_label.set_wrap(true);
+        message_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        message_label.set_max_width_chars(48);
+        message_label.set_xalign(0.5);
         message_label.set_justify(gtk::Justification::Center);
         message_label.add_css_class("breakd-message");
         panel.append(&message_label);
     }
 
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let actions = gtk::Box::new(
+        if layout.vertical_actions {
+            gtk::Orientation::Vertical
+        } else {
+            gtk::Orientation::Horizontal
+        },
+        10,
+    );
     actions.set_halign(gtk::Align::Center);
     actions.set_homogeneous(true);
     let skip = spec.can_skip.then(|| {
@@ -382,8 +399,42 @@ fn build_content(
     if skip.is_some() || postpone.is_some() {
         panel.append(&actions);
     }
-    window.set_child(Some(&panel));
+    let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    frame.set_halign(gtk::Align::Center);
+    frame.set_valign(gtk::Align::Center);
+    frame.set_margin_top(16);
+    frame.set_margin_bottom(16);
+    frame.set_margin_start(16);
+    frame.set_margin_end(16);
+    frame.append(&panel);
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&frame)
+        .build();
+    window.set_child(Some(&scroller));
     (panel, countdown, resume_prompt, skip, postpone)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PanelLayout {
+    content_width: i32,
+    compact: bool,
+    vertical_actions: bool,
+}
+
+fn panel_layout(monitor_width: i32, monitor_height: i32) -> PanelLayout {
+    let compact = monitor_width < 600 || monitor_height < 540;
+    // Leave room for the outer margins and CSS padding; width requests apply
+    // to the panel content rather than its complete rendered box.
+    let horizontal_reserve = if compact { 96 } else { 160 };
+    PanelLayout {
+        content_width: monitor_width
+            .saturating_sub(horizontal_reserve)
+            .clamp(120, 560),
+        compact,
+        vertical_actions: monitor_width < 480,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,10 +654,17 @@ fn install_css(config: &AppConfig) {
             border-radius: 8px;
             padding: 36px 42px;
         }}
+        .breakd-panel-compact {{
+            padding: 20px 24px;
+        }}
         .breakd-title {{ font-size: 26px; font-weight: 600; }}
         .breakd-countdown {{ font-size: 64px; font-weight: 700; }}
         .breakd-resume {{ font-size: 18px; font-weight: 600; }}
         .breakd-message {{ font-size: 18px; }}
+        .breakd-panel-compact .breakd-title {{ font-size: 21px; }}
+        .breakd-panel-compact .breakd-countdown {{ font-size: 42px; }}
+        .breakd-panel-compact .breakd-resume,
+        .breakd-panel-compact .breakd-message {{ font-size: 15px; }}
         .breakd-action {{ min-width: 120px; min-height: 42px; font-size: 16px; }}
         "#,
         opacity = config.display.opacity,
@@ -793,6 +851,19 @@ mod tests {
     fn countdown_rounds_up() {
         assert_eq!(format_countdown(Duration::from_millis(1_001)), "00:02");
         assert_eq!(format_countdown(Duration::from_secs(65)), "01:05");
+    }
+
+    #[test]
+    fn panel_layout_stays_inside_small_monitors() {
+        let small = panel_layout(360, 480);
+        assert_eq!(small.content_width, 264);
+        assert!(small.compact);
+        assert!(small.vertical_actions);
+
+        let large = panel_layout(1_920, 1_080);
+        assert_eq!(large.content_width, 560);
+        assert!(!large.compact);
+        assert!(!large.vertical_actions);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use breakd_coop::{CoopPhase, CoopSnapshot, ScheduledBreak, SharedBreak};
+use breakd_coop::{CoopPhase, CoopPolicy, CoopSnapshot, ScheduledBreak, SharedBreak};
 use breakd_core::{
     AppConfig, BreakKind, BreakSessionId, ClockSample, Command, DueBreakId, DurationMs,
     MissedBreakPolicy, OverlaySpec, StrictMode,
@@ -51,6 +51,8 @@ pub struct ActiveBreak {
     pub manual_resume: bool,
     #[serde(default)]
     pub completion_sound_emitted: bool,
+    #[serde(default)]
+    pub resume_requested: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +196,8 @@ pub struct Scheduler {
     socket_path: String,
     state: SchedulerState,
     last_clock: ClockSample,
+    coop_policy: Option<CoopPolicy>,
+    last_notified_due: Option<DueBreakId>,
 }
 
 impl Scheduler {
@@ -204,6 +208,8 @@ impl Scheduler {
             boot_id,
             socket_path,
             last_clock: now,
+            coop_policy: None,
+            last_notified_due: None,
         };
         if scheduler.config.startup.start_paused {
             scheduler.state = SchedulerState::PausedIndefinitely {
@@ -244,6 +250,8 @@ impl Scheduler {
             socket_path,
             state,
             last_clock: now,
+            coop_policy: None,
+            last_notified_due: None,
         };
         if matches!(scheduler.state, SchedulerState::Recovering { .. }) {
             scheduler.state = Self::fresh_running(&scheduler.config, now);
@@ -361,6 +369,38 @@ impl Scheduler {
         }
     }
 
+    /// A guest overlay can reach its wall-clock deadline a fraction before the
+    /// host due to clock and scheduler jitter. Queue only that forwarded
+    /// request when it arrives within one second of the authoritative host
+    /// deadline; local commands continue to require an already-finished break.
+    pub fn handle_coop_resume_request(
+        &mut self,
+        now: ClockSample,
+    ) -> Result<Vec<Effect>, SchedulerError> {
+        self.last_clock = now;
+        let mut active = self
+            .active_break()
+            .cloned()
+            .ok_or(SchedulerError::NoActiveBreak)?;
+        if !active.manual_resume {
+            return Err(SchedulerError::NotAwaitingResume);
+        }
+        if awaiting_manual_resume(&active, now) {
+            return Ok(self.finish_active(active, now));
+        }
+        const EARLY_RESUME_TOLERANCE_MS: u64 = 1_000;
+        if active.ends_boot_ms.saturating_sub(now.boottime_ms) > EARLY_RESUME_TOLERANCE_MS {
+            return Err(SchedulerError::NotAwaitingResume);
+        }
+        active.resume_requested = true;
+        self.state = match active.due.kind {
+            BreakKind::Mini => SchedulerState::MiniBreak { active },
+            BreakKind::Long => SchedulerState::LongBreak { active },
+            BreakKind::Rest => SchedulerState::RestBreak { active },
+        };
+        Ok(Vec::new())
+    }
+
     pub fn status(&self, now: ClockSample) -> SchedulerStatus {
         let context = self.context();
         let active = self.active_break();
@@ -409,6 +449,16 @@ impl Scheduler {
                     )
                 }),
         }
+    }
+
+    /// Whether the active coordination policy asks this desktop to inhibit
+    /// compositor shortcuts. The guest keeps its local integration mechanism,
+    /// while the host decides whether inhibition is required.
+    pub fn shortcut_inhibition_enabled(&self) -> bool {
+        self.coop_policy.as_ref().map_or(
+            self.config.strict.mode != StrictMode::Off && self.config.strict.inhibit_shortcuts,
+            |policy| policy.inhibit_shortcuts,
+        )
     }
 
     pub fn coop_snapshot(
@@ -492,6 +542,15 @@ impl Scheduler {
                 postpone_count: status.postpone_count,
                 can_skip: status.can_skip,
                 can_postpone: status.can_postpone,
+                policy: Some(CoopPolicy {
+                    notifications_enabled: self.config.notifications.enabled,
+                    mini_notification_lead_ms: self.config.notifications.mini_lead.as_millis(),
+                    long_notification_lead_ms: self.config.notifications.long_lead.as_millis(),
+                    rest_notification_lead_ms: self.config.notifications.rest_lead.as_millis(),
+                    allow_postpone_during_lockout: self.config.strict.allow_postpone_during_lockout,
+                    inhibit_shortcuts: self.config.strict.mode != StrictMode::Off
+                        && self.config.strict.inhibit_shortcuts,
+                }),
             },
             prepared_pending,
         )
@@ -502,6 +561,7 @@ impl Scheduler {
         snapshot: &CoopSnapshot,
         now: ClockSample,
     ) -> Vec<Effect> {
+        self.coop_policy = snapshot.policy.clone();
         let old_visible = visible_active(&self.state).map(|active| active.session_id);
         let context = |pending: Option<PendingBreak>, next_due_mono_ms: u64| ScheduleContext {
             cycle_started_mono_ms: now.monotonic_ms,
@@ -544,6 +604,7 @@ impl Scheduler {
                         ),
                         manual_resume: next.manual_resume,
                         completion_sound_emitted: false,
+                        resume_requested: false,
                     };
                     match next.kind {
                         BreakKind::Mini => SchedulerState::MiniBreak { active },
@@ -588,6 +649,7 @@ impl Scheduler {
                     strict_until_boot_ms,
                     manual_resume: active.manual_resume,
                     completion_sound_emitted: active.completion_sound_emitted,
+                    resume_requested: false,
                 };
                 match active.due.kind {
                     BreakKind::Mini => SchedulerState::MiniBreak { active },
@@ -632,6 +694,7 @@ impl Scheduler {
     }
 
     pub fn reset_after_coop_disconnect(&mut self, now: ClockSample) -> Vec<Effect> {
+        self.coop_policy = None;
         self.last_clock = now;
         self.reset(now)
     }
@@ -670,12 +733,18 @@ impl Scheduler {
                     if now.monotonic_ms >= context.next_due_mono_ms {
                         return self.begin_scheduled_break(kind, context, now);
                     }
+                    let due_id = context
+                        .pending
+                        .as_ref()
+                        .expect("pre-break context has a pending break")
+                        .id;
                     self.state = match kind {
                         BreakKind::Mini => SchedulerState::PreMiniBreak { context },
                         BreakKind::Long => SchedulerState::PreLongBreak { context },
                         BreakKind::Rest => SchedulerState::PreRestBreak { context },
                     };
-                    if self.config.notifications.enabled {
+                    if self.notifications_enabled() && self.last_notified_due != Some(due_id) {
+                        self.last_notified_due = Some(due_id);
                         return vec![Effect::Notify {
                             summary: format!("{} break soon", title_kind(kind)),
                             body: format!("Starts in {}", DurationMs::from_millis(lead)),
@@ -738,11 +807,26 @@ impl Scheduler {
     }
 
     fn notification_lead(&self, kind: BreakKind) -> u64 {
+        if let Some(policy) = &self.coop_policy {
+            return match kind {
+                BreakKind::Mini => policy.mini_notification_lead_ms,
+                BreakKind::Long => policy.long_notification_lead_ms,
+                BreakKind::Rest => policy.rest_notification_lead_ms,
+            };
+        }
         match kind {
             BreakKind::Mini => self.config.notifications.mini_lead.as_millis(),
             BreakKind::Long => self.config.notifications.long_lead.as_millis(),
             BreakKind::Rest => self.config.notifications.rest_lead.as_millis(),
         }
+    }
+
+    fn notifications_enabled(&self) -> bool {
+        self.coop_policy
+            .as_ref()
+            .map_or(self.config.notifications.enabled, |policy| {
+                policy.notifications_enabled
+            })
     }
 
     fn begin_scheduled_break(
@@ -819,6 +903,7 @@ impl Scheduler {
             strict_until_boot_ms,
             manual_resume,
             completion_sound_emitted: false,
+            resume_requested: false,
         };
         let effect = Effect::StartOverlay(self.overlay_spec(&active, now));
         self.state = match kind {
@@ -830,7 +915,7 @@ impl Scheduler {
     }
 
     fn expire_active(&mut self, mut active: ActiveBreak, now: ClockSample) -> Vec<Effect> {
-        if !active.manual_resume {
+        if !active.manual_resume || active.resume_requested {
             return self.finish_active(active, now);
         }
 
@@ -1160,6 +1245,13 @@ impl Scheduler {
                 |policy| policy.can_postpone,
             ),
             manual_resume: active.manual_resume,
+            allow_postpone_during_lockout: self
+                .coop_policy
+                .as_ref()
+                .map_or(self.config.strict.allow_postpone_during_lockout, |policy| {
+                    policy.allow_postpone_during_lockout
+                }),
+            inhibit_shortcuts: self.shortcut_inhibition_enabled(),
             message,
             socket_path: self.socket_path.clone(),
         }
@@ -1617,6 +1709,68 @@ mod tests {
             guest_effects.as_slice(),
             [Effect::StartOverlay(_)]
         ));
+    }
+
+    #[test]
+    fn coop_host_owns_manual_resume_and_notification_timing() {
+        let mut host = test_scheduler();
+        host.config.completion.manual_resume = true;
+        host.config.notifications.enabled = true;
+        host.config.notifications.mini_lead = DurationMs::from_millis(400);
+        host.config.strict.mode = StrictMode::Entire;
+        host.config.strict.allow_postpone_during_lockout = true;
+        host.config.strict.inhibit_shortcuts = true;
+
+        let mut guest = test_scheduler();
+        guest.config.completion.manual_resume = false;
+        guest.config.notifications.enabled = false;
+        guest.config.notifications.mini_lead = DurationMs::from_millis(10);
+        guest.config.strict.mode = StrictMode::Off;
+        guest.config.strict.allow_postpone_during_lockout = false;
+        guest.config.strict.inhibit_shortcuts = false;
+
+        let (mut snapshot, _) = host.coop_snapshot(uuid::Uuid::nil(), 1, clock(0));
+        guest.adopt_coop_snapshot(&snapshot, clock(0));
+        let notification = guest.handle_event(SchedulerEvent::Tick, clock(600));
+        assert!(matches!(notification.as_slice(), [Effect::Notify { .. }]));
+
+        snapshot.revision = 2;
+        guest.adopt_coop_snapshot(&snapshot, clock(610));
+        assert!(
+            guest
+                .handle_event(SchedulerEvent::Tick, clock(610))
+                .is_empty(),
+            "regular snapshots must not repeat the same notification"
+        );
+
+        let effects = guest.handle_event(SchedulerEvent::Tick, clock(1_000));
+        let [Effect::StartOverlay(spec)] = effects.as_slice() else {
+            panic!("expected the mirrored break overlay");
+        };
+        assert!(spec.manual_resume);
+        assert!(spec.allow_postpone_during_lockout);
+        assert!(spec.inhibit_shortcuts);
+        assert!(guest.status(clock(1_100)).awaiting_resume);
+    }
+
+    #[test]
+    fn a_manual_resume_request_just_before_deadline_is_honored_at_zero() {
+        let mut scheduler = test_scheduler();
+        scheduler.config.completion.manual_resume = true;
+        scheduler.handle_command(&Command::Mini, clock(0)).unwrap();
+
+        assert!(
+            scheduler
+                .handle_coop_resume_request(clock(99))
+                .unwrap()
+                .is_empty()
+        );
+        let effects = scheduler.handle_event(SchedulerEvent::Tick, clock(100));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::PlayCompletionSound, Effect::StopOverlay { .. }]
+        ));
+        assert!(matches!(scheduler.state(), SchedulerState::Running { .. }));
     }
 
     #[test]
