@@ -8,8 +8,6 @@ Stretchly: about 408 MB across three Electron processes. `breakd`: 29 MB.
 
 ![Stretchly using about 408 MB of memory while breakd uses 29 MB](docs/assets/breakd-vs-stretchly-memory.png)
 
-This is why you should use my shit instead of Stretchly. xD
-
 ## Install
 
 ### Arch Linux
