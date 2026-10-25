@@ -60,6 +60,13 @@ impl EventSoundClient {
         };
         check_result(result)
     }
+
+    pub fn is_playing(&self) -> Result<bool, EventSoundError> {
+        let mut playing = 0;
+        // SAFETY: The context is alive and the out-pointer is valid for this call.
+        check_result(unsafe { ca_context_playing(self.context.0.as_ptr(), 0, &mut playing) })?;
+        Ok(playing != 0)
+    }
 }
 
 #[derive(Debug)]
@@ -204,6 +211,7 @@ type FinishCallback = unsafe extern "C" fn(*mut CaContext, u32, c_int, *mut c_vo
 unsafe extern "C" {
     fn ca_context_create(context: *mut *mut CaContext) -> c_int;
     fn ca_context_destroy(context: *mut CaContext) -> c_int;
+    fn ca_context_playing(context: *mut CaContext, id: u32, playing: *mut c_int) -> c_int;
     fn ca_context_play_full(
         context: *mut CaContext,
         id: u32,

@@ -1,0 +1,17 @@
+[Unit]
+Description=breakd co-op relay
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/breakd-relay --listen 127.0.0.1:8787
+Restart=on-failure
+RestartSec=2s
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

@@ -24,6 +24,14 @@ breakd status
 
 `breakd` runs as your user. It does not need root access or access to `/dev/input`.
 
+The desktop package stays separate from the optional relay package. A machine
+that will host co-op rooms can install just the relay and its system service:
+
+```bash
+yay -S breakd-relay
+sudo systemctl enable --now breakd-relay.service
+```
+
 ### NixOS
 
 Add the flake and enable its NixOS module:
@@ -84,7 +92,7 @@ breakd settings
 ```
 
 The settings window covers scheduling, break actions, strict mode, display
-behavior, collaboration, idle reset, and tray visibility. It validates changes
+behavior, fullscreen deferral, collaboration, idle reset, and tray visibility. It validates changes
 before saving and reloads the running daemon. Advanced monitor, recovery,
 message, and logging options remain available in TOML:
 
@@ -97,11 +105,67 @@ breakd reload
 
 The default schedule is a 20-second mini break every 10 minutes, a 5-minute long break every 30 minutes after 2 completed mini breaks, and a 30-minute rest break every 2 hours after 2 completed long breaks. Durations accept values such as `20s`, `7m 30s`, `1h`, and `1h 15m`.
 
-Most changes take effect after `breakd reload`. Restart the service after changing `[idle]` or `[logging]`:
+Save in the settings window, or run `breakd reload`, to apply changes. Idle
+detection updates without restarting. Changing intervals or the mini/long break
+thresholds grants a fresh work interval while preserving completed counters and
+any explicit pause. An active break keeps its remaining duration; its appearance
+and controls update on the next break. Save feedback explains these cases.
+
+Only logging changes require restarting the service:
 
 ```bash
 systemctl --user restart breakd.service
 ```
+
+Starting or restarting the daemon always begins a fresh work interval and resets
+the break counters. A saved active or overdue break will not appear on startup,
+including with older configurations containing `startup.recover_state = true`.
+`startup.start_paused = true` still starts the fresh schedule paused. In co-op
+guest mode, the live host continues to control the shared schedule.
+
+For deliberate recovery of a saved schedule, run `breakd daemon --recover-state`
+with the service stopped. This can restore an active break.
+
+### Preview without changing your schedule
+
+Use **Preview overlay** or **Preview sound** in the settings window to try the
+current unsaved appearance or selected sound. You can also preview from the CLI:
+
+```bash
+breakd preview
+breakd preview --sound clean-chime
+```
+
+The overlay preview closes after eight seconds or a click. Escape also closes it
+when focused. Previews do not save configuration, affect counters, join co-op
+rooms, or inhibit compositor shortcuts.
+
+### Fullscreen activity
+
+On Hyprland, defer scheduled breaks while a visible fullscreen application is
+active. Configure this under **Desktop** in settings, or in TOML:
+
+```toml
+[fullscreen]
+behavior = "postpone" # show | postpone | notify-only
+max_delay = "10m"
+```
+
+`show` keeps the normal schedule. `postpone` quietly delays the overlay and its
+reminders; `notify-only` sends an actionable reminder when the break becomes due.
+Both deferring policies start
+the break when fullscreen ends or the maximum delay expires. Manual breaks and
+the reminder's **Start break** action remain available. The tray reports the
+deferral. If fullscreen detection is unavailable, the normal schedule continues.
+In co-op mode, the host decides the shared fullscreen delay.
+
+### Reminder actions
+
+With `notifications.actions = true`, upcoming reminders offer **Start break**
+and, when allowed, **Postpone**. These buttons require notification-server action
+support; other servers receive a normal reminder. Postponement limits still
+apply, and an expired reminder cannot act on a later break. Guests follow the
+host's schedule and use the tray or overlay for shared actions.
 
 ### Strict mode
 
@@ -114,6 +178,12 @@ Set `strict.mode` to one of these values:
 Set `strict.inhibit_shortcuts = true` to request standard Wayland shortcut inhibition while the overlay is active. With `hyprland.submap_fallback = true`, the daemon also enters a temporary Hyprland `breakd` submap because layer surfaces do not reliably suppress compositor bindings on every Hyprland version. The submap is registered at runtime, checked throughout the break, and reset when the break or daemon exits.
 
 This blocks normal Hyprland bindings, including the `SUPER+1..9` workspace bindings. It does not change or unbind them. If the daemon is forcibly killed, its systemd restart resets a stale `breakd` submap. The manual recovery command is `hyprctl dispatch submap reset`.
+
+Shortcut blocking starts only after the overlay has displayed a window. If the
+overlay fails, breakd releases shortcuts and makes bounded recovery attempts;
+unavailable screen time does not count as visible break time. If recovery fails,
+the local schedule returns to a fresh work interval without crediting the failed
+break. A guest keeps following the host while leaving local shortcuts available.
 
 ### Skip and postponement
 

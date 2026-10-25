@@ -51,7 +51,10 @@ impl CoopAction {
             | Command::CoopHost { .. }
             | Command::CoopJoin { .. }
             | Command::CoopLeave
-            | Command::CoopStatus => None,
+            | Command::CoopStatus
+            | Command::OverlayReady { .. }
+            | Command::StartDue { .. }
+            | Command::PostponeDue { .. } => None,
         }
     }
 

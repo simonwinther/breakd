@@ -246,5 +246,25 @@ mod tests {
             Server::bind(&socket),
             Err(IpcError::AlreadyRunning)
         ));
+        assert!(
+            socket.exists(),
+            "duplicate bind must preserve the live socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_server_releases_socket_and_instance_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("breakd/control.sock");
+        let first = Server::bind(&socket).unwrap();
+        assert!(socket.exists());
+
+        drop(first);
+        assert!(!socket.exists());
+
+        let restarted = Server::bind(&socket).unwrap();
+        assert!(socket.exists());
+        drop(restarted);
+        assert!(!socket.exists());
     }
 }

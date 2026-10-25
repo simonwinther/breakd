@@ -1,7 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
-    process::Command,
+    ffi::OsStr,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -15,7 +15,8 @@ use gtk::{gdk, gio, prelude::*};
 use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, KeyboardMode as LayerKeyboardMode, Layer as ShellLayer, LayerShell};
 
-pub fn run(spec: OverlaySpec, config: AppConfig) -> Result<(), String> {
+pub fn run(mut spec: OverlaySpec, config: AppConfig) -> Result<(), String> {
+    sanitize_preview(&mut spec);
     if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland") {
         return Err("breakd overlay requires a Wayland session".into());
     }
@@ -25,9 +26,13 @@ pub fn run(spec: OverlaySpec, config: AppConfig) -> Result<(), String> {
         .application_id(instance.overlay_application_id())
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
+    let startup_error = Rc::new(RefCell::new(None::<String>));
+    let error_for_activate = startup_error.clone();
     application.connect_activate(move |application| {
         if !gtk4_layer_shell::is_supported() {
-            tracing::error!("wlr-layer-shell is unavailable");
+            let message = "wlr-layer-shell is unavailable";
+            tracing::error!("{message}");
+            error_for_activate.replace(Some(message.into()));
             application.quit();
             return;
         }
@@ -75,7 +80,22 @@ pub fn run(spec: OverlaySpec, config: AppConfig) -> Result<(), String> {
         });
     });
     application.run_with_args(&[instance.name()]);
-    Ok(())
+    match startup_error.take() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn sanitize_preview(spec: &mut OverlaySpec) {
+    if spec.preview {
+        spec.ready_token = None;
+        spec.strict_remaining = breakd_core::DurationMs::from_millis(0);
+        spec.can_skip = false;
+        spec.can_postpone = false;
+        spec.manual_resume = false;
+        spec.allow_postpone_during_lockout = false;
+        spec.inhibit_shortcuts = false;
+    }
 }
 
 struct SurfaceWidgets {
@@ -97,13 +117,36 @@ enum ResumePhase {
     Acknowledging,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayDeadlines {
+    countdown: Instant,
+    strict: Instant,
+}
+
+#[derive(Debug, Default)]
+struct OverlayClock {
+    deadlines: Cell<Option<OverlayDeadlines>>,
+}
+
+impl OverlayClock {
+    fn start_once(&self, now: Instant, duration: Duration, strict_remaining: Duration) -> bool {
+        if self.deadlines.get().is_some() {
+            return false;
+        }
+        self.deadlines.set(Some(OverlayDeadlines {
+            countdown: now + duration,
+            strict: now + strict_remaining,
+        }));
+        true
+    }
+}
+
 struct OverlayManager {
     application: gtk::Application,
     instance: breakd_config::RuntimeInstance,
     spec: OverlaySpec,
     config: AppConfig,
-    deadline: Instant,
-    strict_deadline: Instant,
+    clock: Rc<OverlayClock>,
     resume_phase: Rc<Cell<ResumePhase>>,
     surfaces: HashMap<String, SurfaceWidgets>,
 }
@@ -116,6 +159,14 @@ impl OverlayManager {
         instance: breakd_config::RuntimeInstance,
     ) -> Self {
         let now = Instant::now();
+        let clock = Rc::new(OverlayClock::default());
+        if spec.preview {
+            clock.start_once(
+                now,
+                spec.duration.as_duration(),
+                spec.strict_remaining.as_duration(),
+            );
+        }
         let resume_phase = if spec.manual_resume && spec.duration.as_duration().is_zero() {
             ResumePhase::Waiting
         } else {
@@ -124,8 +175,7 @@ impl OverlayManager {
         Self {
             application,
             instance,
-            deadline: now + spec.duration.as_duration(),
-            strict_deadline: now + spec.strict_remaining.as_duration(),
+            clock,
             spec,
             config,
             resume_phase: Rc::new(Cell::new(resume_phase)),
@@ -208,8 +258,15 @@ impl OverlayManager {
         for edge in [Edge::Top, Edge::Right, Edge::Bottom, Edge::Left] {
             window.set_anchor(edge, true);
         }
-        let inhibit_shortcuts = content && input_owner && self.spec.inhibit_shortcuts;
-        window.set_keyboard_mode(if inhibit_shortcuts {
+        let inhibit_shortcuts =
+            content && input_owner && !self.spec.preview && self.spec.inhibit_shortcuts;
+        window.set_keyboard_mode(if self.spec.preview {
+            if content && input_owner {
+                LayerKeyboardMode::OnDemand
+            } else {
+                LayerKeyboardMode::None
+            }
+        } else if inhibit_shortcuts {
             LayerKeyboardMode::Exclusive
         } else if content && input_owner {
             match self.config.display.keyboard_mode {
@@ -236,17 +293,58 @@ impl OverlayManager {
         };
 
         let strict_complete = self.spec.strict_remaining.as_duration().is_zero();
+        let counting = self.resume_phase.get() == ResumePhase::Counting;
         if let Some(button) = &skip {
-            button.set_sensitive(strict_complete);
+            button.set_sensitive(counting && strict_complete);
         }
         if let Some(button) = &postpone {
-            button.set_sensitive(strict_complete || self.spec.allow_postpone_during_lockout);
+            button.set_sensitive(
+                counting && (strict_complete || self.spec.allow_postpone_during_lockout),
+            );
         }
-        if content && input_owner {
-            configure_action_keys(&window, skip.as_ref(), postpone.as_ref());
+        if content && input_owner && !self.spec.preview {
+            configure_action_keys(
+                &window,
+                skip.as_ref(),
+                postpone.as_ref(),
+                self.resume_phase.clone(),
+            );
         }
 
-        configure_input_region(&window, panel.as_ref(), self.config.display.pointer_mode);
+        if self.spec.preview {
+            configure_preview_input(&window, &self.application, input_owner);
+        } else {
+            configure_input_region(
+                &window,
+                panel.as_ref(),
+                self.config.display.pointer_mode,
+                self.resume_phase.clone(),
+            );
+            if content {
+                let clock = self.clock.clone();
+                let duration = self.spec.duration.as_duration();
+                let strict_remaining = self.spec.strict_remaining.as_duration();
+                let session_id = self.spec.session_id.to_string();
+                let ready_token = self.spec.ready_token;
+                window.connect_map(move |_| {
+                    // The daemon restores time spent launching or retrying
+                    // the overlay. Count the supplied durations from the first
+                    // visible content surface here as well, once per process.
+                    if clock.start_once(Instant::now(), duration, strict_remaining)
+                        && let Some(ready_token) = ready_token
+                    {
+                        invoke_cli_arguments_with_completion(
+                            vec![
+                                "overlay-ready".into(),
+                                session_id.clone(),
+                                ready_token.to_string(),
+                            ],
+                            |_| {},
+                        );
+                    }
+                });
+            }
+        }
         window.present();
         configure_shortcut_inhibition(&window, inhibit_shortcuts);
         let mut surface = SurfaceWidgets {
@@ -267,25 +365,33 @@ impl OverlayManager {
     }
 
     fn update_countdown(&mut self) -> bool {
+        let Some(deadlines) = self.clock.deadlines.get() else {
+            // A slow initial map must not consume a real break or make this
+            // process exit before the daemon receives its ready signal.
+            return true;
+        };
         let now = Instant::now();
-        let remaining = self.deadline.saturating_duration_since(now);
+        let remaining = deadlines.countdown.saturating_duration_since(now);
         let text = format_countdown(remaining);
-        let strict_complete = now >= self.strict_deadline;
+        let strict_complete = now >= deadlines.strict;
         let enter_manual_resume = remaining.is_zero()
             && self.spec.manual_resume
             && self.resume_phase.get() == ResumePhase::Counting;
         if enter_manual_resume {
             self.resume_phase.set(ResumePhase::Waiting);
         }
+        let counting = self.resume_phase.get() == ResumePhase::Counting;
         for surface in self.surfaces.values_mut() {
             if let Some(label) = &surface.countdown {
                 label.set_text(&text);
             }
             if let Some(button) = &surface.skip {
-                button.set_sensitive(strict_complete);
+                button.set_sensitive(counting && strict_complete);
             }
             if let Some(button) = &surface.postpone {
-                button.set_sensitive(strict_complete || self.spec.allow_postpone_during_lockout);
+                button.set_sensitive(
+                    counting && (strict_complete || self.spec.allow_postpone_during_lockout),
+                );
             }
             if enter_manual_resume {
                 surface.enter_manual_resume(self.resume_phase.clone());
@@ -337,10 +443,14 @@ fn build_content(
         panel.add_css_class("breakd-panel-compact");
     }
 
-    let title = gtk::Label::new(Some(match spec.kind {
-        breakd_core::BreakKind::Mini => "Mini break",
-        breakd_core::BreakKind::Long => "Long break",
-        breakd_core::BreakKind::Rest => "Rest break",
+    let title = gtk::Label::new(Some(if spec.preview {
+        "Overlay preview"
+    } else {
+        match spec.kind {
+            breakd_core::BreakKind::Mini => "Mini break",
+            breakd_core::BreakKind::Long => "Long break",
+            breakd_core::BreakKind::Rest => "Rest break",
+        }
     }));
     title.set_wrap(true);
     title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
@@ -352,8 +462,12 @@ fn build_content(
     countdown.add_css_class("breakd-countdown");
     panel.append(&countdown);
 
-    let resume_prompt = gtk::Label::new(Some("Press any key or click to continue"));
-    resume_prompt.set_visible(false);
+    let resume_prompt = gtk::Label::new(Some(if spec.preview {
+        "Closes in 8 seconds. Press Escape or click to close."
+    } else {
+        "Press any key or click to continue"
+    }));
+    resume_prompt.set_visible(spec.preview);
     resume_prompt.set_wrap(true);
     resume_prompt.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     resume_prompt.set_justify(gtk::Justification::Center);
@@ -381,7 +495,7 @@ fn build_content(
     );
     actions.set_halign(gtk::Align::Center);
     actions.set_homogeneous(true);
-    let skip = spec.can_skip.then(|| {
+    let skip = (spec.can_skip && !spec.preview).then(|| {
         let button = gtk::Button::with_label("Skip");
         button.add_css_class("breakd-action");
         button.connect_clicked(|_| invoke_cli("skip"));
@@ -389,7 +503,7 @@ fn build_content(
         button
     });
 
-    let postpone = spec.can_postpone.then(|| {
+    let postpone = (spec.can_postpone && !spec.preview).then(|| {
         let button = gtk::Button::with_label("Postpone");
         button.add_css_class("breakd-action");
         button.connect_clicked(|_| invoke_cli("postpone"));
@@ -443,7 +557,14 @@ enum OverlayAction {
     Postpone,
 }
 
-fn action_for_key(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<OverlayAction> {
+fn action_for_key(
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+    phase: ResumePhase,
+) -> Option<OverlayAction> {
+    if phase != ResumePhase::Counting {
+        return None;
+    }
     let command_modifiers = gdk::ModifierType::SHIFT_MASK
         | gdk::ModifierType::CONTROL_MASK
         | gdk::ModifierType::ALT_MASK
@@ -466,24 +587,25 @@ fn configure_action_keys(
     window: &gtk::ApplicationWindow,
     skip: Option<&gtk::Button>,
     postpone: Option<&gtk::Button>,
+    resume_phase: Rc<Cell<ResumePhase>>,
 ) {
     let skip = skip.map(|button| button.downgrade());
     let postpone = postpone.map(|button| button.downgrade());
     let controller = gtk::EventControllerKey::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     controller.connect_key_pressed(move |_, key, _, modifiers| {
-        let Some(action) = action_for_key(key, modifiers) else {
+        let Some(action) = action_for_key(key, modifiers, resume_phase.get()) else {
             return glib::Propagation::Proceed;
         };
         let enabled = match action {
             OverlayAction::Skip => skip
                 .as_ref()
                 .and_then(glib::WeakRef::upgrade)
-                .is_some_and(|button| button.is_sensitive()),
+                .is_some_and(|button| button.is_visible() && button.is_sensitive()),
             OverlayAction::Postpone => postpone
                 .as_ref()
                 .and_then(glib::WeakRef::upgrade)
-                .is_some_and(|button| button.is_sensitive()),
+                .is_some_and(|button| button.is_visible() && button.is_sensitive()),
         };
         if enabled {
             invoke_cli(match action {
@@ -498,6 +620,36 @@ fn configure_action_keys(
     window.add_controller(controller);
 }
 
+fn configure_preview_input(
+    window: &gtk::ApplicationWindow,
+    application: &gtk::Application,
+    input_owner: bool,
+) {
+    capture_all_input(window);
+    let application_for_click = application.clone();
+    let click = gtk::GestureClick::new();
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.connect_pressed(move |gesture, _, _, _| {
+        application_for_click.quit();
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    window.add_controller(click);
+    if input_owner {
+        let application = application.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                application.quit();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        window.add_controller(keys);
+    }
+}
+
 fn configure_manual_resume_input(
     window: &gtk::ApplicationWindow,
     resume_phase: Rc<Cell<ResumePhase>>,
@@ -509,9 +661,7 @@ fn configure_manual_resume_input(
     let click = gtk::GestureClick::new();
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
     click.connect_pressed(move |gesture, _, _, _| {
-        if begin_resume(&phase_for_click) {
-            invoke_cli("resume-break");
-        }
+        request_manual_resume(phase_for_click.clone());
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
     window.add_controller(click);
@@ -523,9 +673,7 @@ fn configure_manual_resume_input(
     let controller = gtk::EventControllerKey::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     controller.connect_key_pressed(move |_, _, _, _| {
-        if begin_resume(&resume_phase) {
-            invoke_cli("resume-break");
-        }
+        request_manual_resume(resume_phase.clone());
         glib::Propagation::Stop
     });
     window.add_controller(controller);
@@ -552,10 +700,25 @@ fn begin_resume(phase: &Cell<ResumePhase>) -> bool {
     true
 }
 
+fn finish_resume(phase: &Cell<ResumePhase>, succeeded: bool) {
+    if !succeeded && phase.get() == ResumePhase::Acknowledging {
+        phase.set(ResumePhase::Waiting);
+    }
+}
+
+fn request_manual_resume(phase: Rc<Cell<ResumePhase>>) {
+    if begin_resume(&phase) {
+        invoke_cli_with_completion("resume-break", move |succeeded| {
+            finish_resume(&phase, succeeded);
+        });
+    }
+}
+
 fn configure_input_region(
     window: &gtk::ApplicationWindow,
     panel: Option<&gtk::Box>,
     mode: PointerMode,
+    resume_phase: Rc<Cell<ResumePhase>>,
 ) {
     if mode == PointerMode::Block {
         return;
@@ -570,7 +733,14 @@ fn configure_input_region(
             };
             let window = window.downgrade();
             let panel = panel.downgrade();
-            surface.connect_layout(move |_, _, _| {
+            let resume_phase = resume_phase.clone();
+            surface.connect_layout(move |surface, _, _| {
+                // Showing the resume prompt changes the layout. Preserve full
+                // click capture while waiting, even in controls-only mode.
+                if resume_phase.get() != ResumePhase::Counting {
+                    surface.set_input_region(None);
+                    return;
+                }
                 let (Some(window), Some(panel)) = (window.upgrade(), panel.upgrade()) else {
                     return;
                 };
@@ -626,18 +796,43 @@ fn set_panel_input_region(window: &gtk::ApplicationWindow, panel: &gtk::Box) {
 }
 
 fn invoke_cli(command: &str) {
-    match std::env::current_exe().and_then(|executable| {
-        Command::new(executable)
-            .arg(command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map(|_| ())
-    }) {
-        Ok(()) => {}
-        Err(error) => tracing::warn!(%error, command, "failed to invoke breakd command"),
-    }
+    invoke_cli_with_completion(command, |_| {});
+}
+
+fn invoke_cli_with_completion(command: &str, completed: impl FnOnce(bool) + 'static) {
+    invoke_cli_arguments_with_completion(vec![command.into()], completed);
+}
+
+fn invoke_cli_arguments_with_completion(
+    arguments: Vec<String>,
+    completed: impl FnOnce(bool) + 'static,
+) {
+    glib::spawn_future_local(async move {
+        let result = match std::env::current_exe() {
+            Ok(executable) => {
+                let mut argv = vec![executable.as_os_str()];
+                argv.extend(arguments.iter().map(OsStr::new));
+                match gio::Subprocess::newv(
+                    &argv,
+                    gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_SILENCE,
+                ) {
+                    // Waiting asynchronously keeps GTK responsive and reaps the
+                    // command process. A failed acknowledgement can then be retried.
+                    Ok(process) => process
+                        .wait_check_future()
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        let succeeded = result.is_ok();
+        if let Err(error) = result {
+            tracing::warn!(%error, ?arguments, "breakd command failed");
+        }
+        completed(succeeded);
+    });
 }
 
 fn install_css(config: &AppConfig) {
@@ -873,23 +1068,139 @@ mod tests {
     }
 
     #[test]
+    fn slow_mapping_does_not_consume_break_or_strict_time() {
+        let created = Instant::now();
+        let clock = OverlayClock::default();
+        assert!(clock.deadlines.get().is_none());
+
+        let mapped = created + Duration::from_secs(120);
+        assert!(clock.start_once(mapped, Duration::from_secs(8), Duration::from_secs(3)));
+        let deadlines = clock.deadlines.get().unwrap();
+        assert_eq!(
+            deadlines.countdown.saturating_duration_since(mapped),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            deadlines.strict.saturating_duration_since(mapped),
+            Duration::from_secs(3)
+        );
+
+        // Another monitor mapping or remapping must not restart the timer or
+        // produce a second daemon-ready acknowledgement.
+        assert!(!clock.start_once(
+            mapped + Duration::from_secs(2),
+            Duration::from_secs(8),
+            Duration::from_secs(3)
+        ));
+        assert_eq!(clock.deadlines.get(), Some(deadlines));
+    }
+
+    #[test]
+    fn previews_never_enable_daemon_actions_or_inhibition() {
+        let mut spec = OverlaySpec {
+            session_id: breakd_core::BreakSessionId::new(),
+            ready_token: Some(breakd_core::BreakSessionId::new()),
+            kind: breakd_core::BreakKind::Mini,
+            duration: breakd_core::DurationMs::from_millis(8_000),
+            strict_remaining: breakd_core::DurationMs::from_millis(5_000),
+            can_skip: true,
+            can_postpone: true,
+            manual_resume: true,
+            allow_postpone_during_lockout: true,
+            inhibit_shortcuts: true,
+            preview: true,
+            message: None,
+            socket_path: String::new(),
+        };
+        sanitize_preview(&mut spec);
+        assert!(spec.strict_remaining.as_duration().is_zero());
+        assert!(!spec.can_skip && !spec.can_postpone && !spec.manual_resume);
+        assert!(!spec.inhibit_shortcuts && !spec.allow_postpone_during_lockout);
+        assert!(spec.preview);
+        assert_eq!(spec.ready_token, None);
+    }
+
+    #[test]
+    #[ignore = "requires a display server"]
+    fn preview_content_has_no_scheduler_controls() {
+        gtk::init().unwrap();
+        let spec = OverlaySpec {
+            session_id: breakd_core::BreakSessionId::new(),
+            ready_token: None,
+            kind: breakd_core::BreakKind::Mini,
+            duration: breakd_core::DurationMs::from_millis(8_000),
+            strict_remaining: breakd_core::DurationMs::from_millis(0),
+            can_skip: true,
+            can_postpone: true,
+            manual_resume: false,
+            allow_postpone_during_lockout: false,
+            inhibit_shortcuts: false,
+            preview: true,
+            message: Some("Preview exercise suggestion".into()),
+            socket_path: String::new(),
+        };
+        let window = gtk::ApplicationWindow::builder().build();
+        let (panel, countdown, prompt, skip, postpone) =
+            build_content(&window, &spec, 1_920, 1_080);
+        assert!(skip.is_none() && postpone.is_none());
+        assert_eq!(countdown.text(), "00:08");
+        // is_visible includes every ancestor. Check the actual presented
+        // preview tree so the dismissal hint must be visible on screen.
+        window.present();
+        assert!(prompt.is_visible());
+        assert!(prompt.text().contains("click to close"));
+        let title = panel
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(title.text(), "Overlay preview");
+        window.close();
+    }
+
+    #[test]
     fn plain_action_keys_are_recognized() {
         assert_eq!(
-            action_for_key(gdk::Key::s, gdk::ModifierType::empty()),
+            action_for_key(
+                gdk::Key::s,
+                gdk::ModifierType::empty(),
+                ResumePhase::Counting
+            ),
             Some(OverlayAction::Skip)
         );
         assert_eq!(
-            action_for_key(gdk::Key::P, gdk::ModifierType::LOCK_MASK),
+            action_for_key(
+                gdk::Key::P,
+                gdk::ModifierType::LOCK_MASK,
+                ResumePhase::Counting
+            ),
             Some(OverlayAction::Postpone)
         );
         assert_eq!(
-            action_for_key(gdk::Key::s, gdk::ModifierType::CONTROL_MASK),
+            action_for_key(
+                gdk::Key::s,
+                gdk::ModifierType::CONTROL_MASK,
+                ResumePhase::Counting
+            ),
             None
         );
         assert_eq!(
-            action_for_key(gdk::Key::Escape, gdk::ModifierType::empty()),
+            action_for_key(
+                gdk::Key::Escape,
+                gdk::ModifierType::empty(),
+                ResumePhase::Counting
+            ),
             None
         );
+    }
+
+    #[test]
+    fn action_keys_do_not_intercept_manual_resume() {
+        for phase in [ResumePhase::Waiting, ResumePhase::Acknowledging] {
+            for key in [gdk::Key::s, gdk::Key::p] {
+                assert_eq!(action_for_key(key, gdk::ModifierType::empty(), phase), None);
+            }
+        }
     }
 
     #[test]
@@ -897,6 +1208,20 @@ mod tests {
         let phase = Cell::new(ResumePhase::Waiting);
 
         assert!(begin_resume(&phase));
+        assert_eq!(phase.get(), ResumePhase::Acknowledging);
+        assert!(!begin_resume(&phase));
+    }
+
+    #[test]
+    fn failed_manual_resume_can_be_retried() {
+        let phase = Cell::new(ResumePhase::Waiting);
+
+        assert!(begin_resume(&phase));
+        finish_resume(&phase, false);
+        assert_eq!(phase.get(), ResumePhase::Waiting);
+        assert!(begin_resume(&phase));
+
+        finish_resume(&phase, true);
         assert_eq!(phase.get(), ResumePhase::Acknowledging);
         assert!(!begin_resume(&phase));
     }

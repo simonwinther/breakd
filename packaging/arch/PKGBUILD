@@ -1,26 +1,25 @@
 # Maintainer: Simon Winther <simonwinther@users.noreply.github.com>
-pkgname=breakd
+pkgbase=breakd
+pkgname=('breakd' 'breakd-relay')
 pkgver=0.1.12 # x-release-please-version
 pkgrel=1
-pkgdesc='Wayland-native break reminder with multi-monitor overlays'
 arch=('x86_64')
 url='https://github.com/simonwinther/breakd'
 license=('MIT' 'BSD-2-Clause')
-depends=('cairo' 'glib2' 'glibc' 'graphene' 'gtk4' 'gtk4-layer-shell' 'libcanberra')
 makedepends=('cargo' 'pkgconf')
 options=('!debug')
-source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+source=("$pkgbase-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgbase-$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 prepare() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgbase-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_HOME="$srcdir/cargo-home"
   cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
 }
 
 build() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgbase-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_HOME="$srcdir/cargo-home"
   export CARGO_TARGET_DIR="$srcdir/target"
@@ -29,7 +28,7 @@ build() {
 }
 
 check() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgbase-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_HOME="$srcdir/cargo-home"
   export CARGO_TARGET_DIR="$srcdir/target"
@@ -37,8 +36,11 @@ check() {
   cargo test --frozen --workspace
 }
 
-package() {
-  cd "$pkgname-$pkgver"
+package_breakd() {
+  pkgdesc='Wayland-native break reminder with multi-monitor overlays'
+  depends=('cairo' 'glib2' 'glibc' 'graphene' 'gtk4' 'gtk4-layer-shell' 'libcanberra')
+
+  cd "$pkgbase-$pkgver"
   install -Dm755 "$srcdir/target/release/breakd" "$pkgdir/usr/bin/breakd"
   install -dm755 "$pkgdir/usr/share/breakd"
   install -m644 crates/platform-linux/assets/*.oga "$pkgdir/usr/share/breakd/"
@@ -52,4 +54,18 @@ package() {
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/breakd/LICENSE"
   install -Dm644 THIRD_PARTY_NOTICES.md \
     "$pkgdir/usr/share/licenses/breakd/THIRD_PARTY_NOTICES.md"
+}
+
+package_breakd-relay() {
+  pkgdesc='Small authenticated WebSocket relay for breakd co-op rooms'
+  depends=('glibc')
+
+  cd "$pkgbase-$pkgver"
+  install -Dm755 "$srcdir/target/release/breakd-relay" "$pkgdir/usr/bin/breakd-relay"
+  install -Dm644 packaging/systemd/breakd-relay.service \
+    "$pkgdir/usr/lib/systemd/system/breakd-relay.service"
+  install -Dm644 docs/coop.md "$pkgdir/usr/share/doc/breakd-relay/coop.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/breakd-relay/LICENSE"
+  install -Dm644 THIRD_PARTY_NOTICES.md \
+    "$pkgdir/usr/share/licenses/breakd-relay/THIRD_PARTY_NOTICES.md"
 }

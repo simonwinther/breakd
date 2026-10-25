@@ -1,20 +1,26 @@
 pkgbase = breakd
-	pkgdesc = Wayland-native break reminder with multi-monitor overlays
-	pkgver = 0.1.0
+	pkgver = 0.1.12
 	pkgrel = 1
 	url = https://github.com/simonwinther/breakd
 	arch = x86_64
 	license = MIT
+	license = BSD-2-Clause
 	makedepends = cargo
 	makedepends = pkgconf
+	options = !debug
+	source = breakd-0.1.12.tar.gz::https://github.com/simonwinther/breakd/releases/download/v0.1.12/breakd-0.1.12.tar.gz
+	sha256sums = SKIP
+
+pkgname = breakd
+	pkgdesc = Wayland-native break reminder with multi-monitor overlays
 	depends = cairo
 	depends = glib2
 	depends = glibc
 	depends = graphene
 	depends = gtk4
 	depends = gtk4-layer-shell
-	options = !debug
-	source = breakd-0.1.0.tar.gz::https://github.com/simonwinther/breakd/releases/download/v0.1.0/breakd-0.1.0.tar.gz
-	sha256sums = SKIP
+	depends = libcanberra
 
-pkgname = breakd
+pkgname = breakd-relay
+	pkgdesc = Small authenticated WebSocket relay for breakd co-op rooms
+	depends = glibc

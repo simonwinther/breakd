@@ -1,7 +1,10 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use breakd_core::{Command, DurationMs, OverlaySpec, Response};
+use breakd_core::{
+    AppConfig, BreakKind, BreakSessionId, Command, CompletionSound, DurationMs, OverlaySpec,
+    Response,
+};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::time::{Duration, Instant, sleep};
@@ -16,8 +19,12 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Run the long-lived scheduler daemon.
-    Daemon,
+    /// Run the scheduler daemon with a fresh work interval.
+    Daemon {
+        /// Restore the saved schedule instead of resetting it on startup.
+        #[arg(long)]
+        recover_state: bool,
+    },
     /// Show scheduler status.
     Status {
         #[arg(long)]
@@ -62,8 +69,21 @@ enum CliCommand {
     },
     /// Open the graphical configuration window.
     Settings,
+    /// Preview the overlay without changing your schedule, or play a completion sound.
+    Preview {
+        /// Play a sound instead: warm-rise, soft-bloom, deep-halo, or clean-chime.
+        #[arg(long, value_parser = parse_completion_sound)]
+        sound: Option<CompletionSound>,
+    },
     #[command(hide = true)]
     Overlay,
+    #[command(hide = true)]
+    OverlayReady {
+        #[arg(value_parser = parse_session_id)]
+        session_id: BreakSessionId,
+        #[arg(value_parser = parse_session_id)]
+        ready_token: BreakSessionId,
+    },
     /// Print the default TOML configuration.
     ExampleConfig,
 }
@@ -101,8 +121,20 @@ async fn main() -> ExitCode {
 
 async fn execute(arguments: Arguments) -> Result<()> {
     match arguments.command {
-        CliCommand::Daemon => breakd_daemon::run().await,
+        CliCommand::Daemon { recover_state } => breakd_daemon::run(recover_state).await,
         CliCommand::Overlay => run_overlay(),
+        CliCommand::Preview { sound } => run_preview(sound).await,
+        CliCommand::OverlayReady {
+            session_id,
+            ready_token,
+        } => {
+            request(Command::OverlayReady {
+                session_id,
+                ready_token,
+            })
+            .await?;
+            Ok(())
+        }
         CliCommand::ExampleConfig => {
             print!("{}", breakd_config::example_toml());
             Ok(())
@@ -256,6 +288,58 @@ fn run_overlay() -> Result<()> {
     breakd_wayland_overlay::run(spec, config).map_err(anyhow::Error::msg)
 }
 
+fn parse_session_id(value: &str) -> Result<BreakSessionId, String> {
+    serde_json::from_value(Value::String(value.to_owned()))
+        .map_err(|_| "expected a valid overlay session ID or ready token".to_owned())
+}
+
+fn parse_completion_sound(value: &str) -> Result<CompletionSound, String> {
+    serde_json::from_value(Value::String(value.to_owned()))
+        .map_err(|_| "choose warm-rise, soft-bloom, deep-halo, or clean-chime".to_owned())
+}
+
+fn preview_config() -> Result<AppConfig> {
+    let config = match std::env::var("BREAKD_PREVIEW_CONFIG") {
+        Ok(encoded) => serde_json::from_str(&encoded).context("invalid preview configuration")?,
+        Err(std::env::VarError::NotPresent) => {
+            breakd_config::load().context("load preview configuration")?
+        }
+        Err(error) => return Err(error).context("read preview configuration"),
+    };
+    breakd_config::validate(&config).context("validate preview configuration")?;
+    Ok(config)
+}
+
+fn preview_spec(config: &AppConfig) -> OverlaySpec {
+    OverlaySpec {
+        session_id: BreakSessionId::new(),
+        ready_token: None,
+        kind: BreakKind::Mini,
+        duration: DurationMs::from_millis(8_000),
+        strict_remaining: DurationMs::from_millis(0),
+        can_skip: false,
+        can_postpone: false,
+        manual_resume: false,
+        allow_postpone_during_lockout: false,
+        inhibit_shortcuts: false,
+        preview: true,
+        message: config
+            .content
+            .show_message
+            .then(|| config.content.messages.first().cloned())
+            .flatten(),
+        socket_path: String::new(),
+    }
+}
+
+async fn run_preview(sound: Option<CompletionSound>) -> Result<()> {
+    if let Some(sound) = sound {
+        return breakd_daemon::preview_sound(sound).await;
+    }
+    let config = preview_config()?;
+    breakd_wayland_overlay::run(preview_spec(&config), config).map_err(anyhow::Error::msg)
+}
+
 fn init_logging() {
     let logging = breakd_config::load().ok().map(|config| config.logging);
     let level = logging
@@ -281,6 +365,83 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_starts_fresh_unless_recovery_is_explicit() {
+        assert!(matches!(
+            Arguments::try_parse_from(["breakd", "daemon"])
+                .unwrap()
+                .command,
+            CliCommand::Daemon {
+                recover_state: false
+            }
+        ));
+        assert!(matches!(
+            Arguments::try_parse_from(["breakd", "daemon", "--recover-state"])
+                .unwrap()
+                .command,
+            CliCommand::Daemon {
+                recover_state: true
+            }
+        ));
+    }
+
+    #[test]
+    fn preview_cli_is_standalone_and_rejects_unknown_sounds() {
+        assert!(matches!(
+            Arguments::try_parse_from(["breakd", "preview"])
+                .unwrap()
+                .command,
+            CliCommand::Preview { sound: None }
+        ));
+        assert!(matches!(
+            Arguments::try_parse_from(["breakd", "preview", "--sound", "clean-chime"])
+                .unwrap()
+                .command,
+            CliCommand::Preview {
+                sound: Some(CompletionSound::CleanChime)
+            }
+        ));
+        assert!(Arguments::try_parse_from(["breakd", "preview", "--sound", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn overlay_ready_requires_valid_session_and_attempt_ids() {
+        let session_id = BreakSessionId::new();
+        let ready_token = BreakSessionId::new();
+        let session_text = session_id.to_string();
+        let token_text = ready_token.to_string();
+        assert!(matches!(
+            Arguments::try_parse_from(["breakd", "overlay-ready", &session_text, &token_text]).unwrap().command,
+            CliCommand::OverlayReady { session_id: parsed_session, ready_token: parsed_token }
+                if parsed_session == session_id && parsed_token == ready_token
+        ));
+        assert!(Arguments::try_parse_from(["breakd", "overlay-ready", &session_text]).is_err());
+        assert!(
+            Arguments::try_parse_from(["breakd", "overlay-ready", &session_text, "stale"]).is_err()
+        );
+        assert!(
+            Arguments::try_parse_from(["breakd", "overlay-ready", "invalid", &token_text]).is_err()
+        );
+    }
+
+    #[test]
+    fn preview_spec_cannot_change_a_running_break() {
+        let mut config = breakd_config::defaults();
+        config.strict.inhibit_shortcuts = true;
+        config.completion.manual_resume = true;
+        let spec = preview_spec(&config);
+        assert!(spec.preview);
+        assert_eq!(spec.duration.as_millis(), 8_000);
+        assert!(spec.strict_remaining.as_duration().is_zero());
+        assert!(!spec.can_skip && !spec.can_postpone && !spec.manual_resume);
+        assert!(!spec.inhibit_shortcuts && !spec.allow_postpone_during_lockout);
+        assert!(spec.socket_path.is_empty());
+        assert_eq!(spec.ready_token, None);
+        assert_eq!(spec.message, config.content.messages.first().cloned());
+        config.content.show_message = false;
+        assert_eq!(preview_spec(&config).message, None);
+    }
 
     #[test]
     fn coop_join_waits_for_the_first_host_snapshot() {

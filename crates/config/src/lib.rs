@@ -187,7 +187,6 @@ pub fn defaults() -> AppConfig {
         },
         startup: StartupConfig {
             start_paused: false,
-            recover_state: true,
         },
         hyprland: HyprlandConfig {
             enabled: true,
@@ -351,9 +350,10 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             "rest interval, duration, and after_longs must be positive".into(),
         ));
     }
-    if config.notifications.mini_lead >= config.schedule.mini.interval
-        || config.notifications.long_lead >= config.schedule.long.interval
-        || config.notifications.rest_lead >= config.schedule.rest.interval
+    if config.notifications.enabled
+        && (config.notifications.mini_lead >= config.schedule.mini.interval
+            || config.notifications.long_lead >= config.schedule.long.interval
+            || config.notifications.rest_lead >= config.schedule.rest.interval)
     {
         return Err(ConfigError::Validation(
             "notification lead must be shorter than its interval".into(),
@@ -390,9 +390,11 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             "display.dim_color must be a #RRGGBB value".into(),
         ));
     }
-    if config.fullscreen.behavior != FullscreenBehavior::Show {
+    if config.fullscreen.behavior != FullscreenBehavior::Show
+        && config.fullscreen.max_delay.as_millis() == 0
+    {
         return Err(ConfigError::Validation(
-            "only fullscreen.behavior = \"show\" is supported in this release".into(),
+            "fullscreen.max_delay must be positive when fullscreen breaks are deferred".into(),
         ));
     }
     if !matches!(
@@ -505,6 +507,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_startup_recovery_setting_is_accepted_and_removed_on_save() {
+        let mut value: toml::Value = toml::from_str(&example_toml()).unwrap();
+        value["startup"]
+            .as_table_mut()
+            .unwrap()
+            .insert("recover_state".into(), toml::Value::Boolean(true));
+        let decoded: AppConfig = toml::from_str(&toml::to_string(&value).unwrap()).unwrap();
+        assert_eq!(decoded, defaults());
+        assert!(!toml::to_string(&decoded).unwrap().contains("recover_state"));
+    }
+
+    #[test]
     fn invalid_opacity_is_rejected() {
         let mut config = defaults();
         config.display.opacity = 1.1;
@@ -541,9 +555,27 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_fullscreen_policy_is_rejected() {
+    fn fullscreen_deferral_requires_a_positive_limit() {
         let mut config = defaults();
         config.fullscreen.behavior = FullscreenBehavior::Postpone;
+        assert!(validate(&config).is_ok());
+        config.fullscreen.max_delay = DurationMs::from_millis(0);
+        assert!(validate(&config).is_err());
+        config.fullscreen.behavior = FullscreenBehavior::NotifyOnly;
+        assert!(validate(&config).is_err());
+        config.fullscreen.behavior = FullscreenBehavior::Show;
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn disabled_notifications_do_not_validate_unused_leads() {
+        let mut config = defaults();
+        config.notifications.enabled = false;
+        config.notifications.mini_lead = config.schedule.mini.interval;
+        config.notifications.long_lead = config.schedule.long.interval;
+        config.notifications.rest_lead = config.schedule.rest.interval;
+        assert!(validate(&config).is_ok());
+        config.notifications.enabled = true;
         assert!(validate(&config).is_err());
     }
 

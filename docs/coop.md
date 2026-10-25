@@ -51,6 +51,19 @@ breaks.example.net {
 Then use `wss://breaks.example.net/ws` as the relay URL. The relay accepts any
 request path, so a proxy can dedicate `/ws` or an entire hostname to it.
 
+On Arch Linux, the `breakd-relay` AUR package installs the binary and a
+hardened system service:
+
+```bash
+yay -S breakd-relay
+sudo systemctl enable --now breakd-relay.service
+```
+
+The unit binds to `127.0.0.1:8787` by default; edit
+`/usr/lib/systemd/system/breakd-relay.service` (or drop an override with
+`systemctl edit breakd-relay.service`) to change the listen address, then
+`sudo systemctl daemon-reload && sudo systemctl restart breakd-relay.service`.
+
 On NixOS, the flake module can run the isolated relay service:
 
 ```nix

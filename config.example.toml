@@ -175,12 +175,13 @@ lock_counts_as_break = true
 recover_active_break = true
 
 [fullscreen]
-behavior = "show" # show is the dependable MVP behavior
-max_delay = "10m"
+behavior = "show" # show | postpone | notify-only
+max_delay = "10m" # fullscreen deferral limit; breaks start on exit or at this limit
 
 [startup]
 start_paused = false
-recover_state = true
+# Daemon starts reset the schedule. Use `breakd daemon --recover-state` only
+# when you explicitly want to restore a saved schedule, including active breaks.
 
 [hyprland]
 enabled = true

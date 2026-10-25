@@ -11,6 +11,7 @@ pub enum TrayAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayState {
     pub paused: bool,
+    pub deferred: bool,
     pub active_kind: Option<BreakKind>,
     pub remaining_seconds: Option<u64>,
     pub awaiting_resume: bool,
@@ -35,6 +36,9 @@ impl TrayState {
             .remaining_seconds
             .map(format_duration)
             .unwrap_or_else(|| "unknown".into());
+        if self.deferred {
+            return format!("Break delayed for fullscreen: {remaining}");
+        }
         match self.active_kind {
             Some(BreakKind::Mini) => format!("Mini break: {remaining}"),
             Some(BreakKind::Long) => format!("Long break: {remaining}"),
@@ -241,6 +245,7 @@ mod tests {
     fn formats_status_for_each_scheduler_mode() {
         let running = TrayState {
             paused: false,
+            deferred: false,
             active_kind: None,
             remaining_seconds: Some(65),
             awaiting_resume: false,
@@ -263,6 +268,15 @@ mod tests {
         };
         assert_eq!(resting.status_text(), "Rest break: 30:00");
 
+        let deferred = TrayState {
+            deferred: true,
+            ..running.clone()
+        };
+        assert_eq!(
+            deferred.status_text(),
+            "Break delayed for fullscreen: 01:05"
+        );
+
         let paused = TrayState {
             paused: true,
             ..running
@@ -271,6 +285,7 @@ mod tests {
 
         let waiting = TrayState {
             paused: false,
+            deferred: false,
             active_kind: Some(BreakKind::Long),
             remaining_seconds: Some(0),
             awaiting_resume: true,
@@ -289,6 +304,7 @@ mod tests {
         let mut tray = BreakdTray {
             state: TrayState {
                 paused: false,
+                deferred: false,
                 active_kind: None,
                 remaining_seconds: Some(60),
                 awaiting_resume: false,
@@ -315,6 +331,7 @@ mod tests {
         let mut tray = BreakdTray {
             state: TrayState {
                 paused: false,
+                deferred: false,
                 active_kind: None,
                 remaining_seconds: Some(60),
                 awaiting_resume: false,
@@ -338,6 +355,7 @@ mod tests {
         let mut tray = BreakdTray {
             state: TrayState {
                 paused: false,
+                deferred: false,
                 active_kind: Some(BreakKind::Long),
                 remaining_seconds: Some(0),
                 awaiting_resume: true,

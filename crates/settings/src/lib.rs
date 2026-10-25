@@ -7,8 +7,8 @@ use std::{
 };
 
 use breakd_core::{
-    AppConfig, Command, CompletionSound, ContentSelector, DisplayMode, DurationMs, PointerMode,
-    StrictMode,
+    AppConfig, Command, CompletionSound, ContentSelector, DisplayMode, DurationMs,
+    FullscreenBehavior, PointerMode, StrictMode,
 };
 use gtk::{gio, prelude::*};
 use gtk4 as gtk;
@@ -83,6 +83,8 @@ struct SettingsWidgets {
     idle_enabled: gtk::Switch,
     idle_reset_after: gtk::Entry,
     tray_enabled: gtk::Switch,
+    fullscreen_behavior: gtk::DropDown,
+    fullscreen_max_delay: gtk::Entry,
 }
 
 #[derive(Clone)]
@@ -131,24 +133,84 @@ enum CoopUiAction {
 }
 
 impl SettingsWidgets {
-    fn collect(&self, base: &AppConfig) -> Result<AppConfig, String> {
+    fn from_pages(
+        schedule_widgets: SchedulePageWidgets,
+        action_widgets: ActionPageWidgets,
+        desktop_widgets: DesktopPageWidgets,
+    ) -> Self {
+        Self {
+            mini_interval: schedule_widgets.0,
+            mini_duration: schedule_widgets.1,
+            long_interval: schedule_widgets.2,
+            long_duration: schedule_widgets.3,
+            long_after_minis: schedule_widgets.4,
+            notifications_enabled: schedule_widgets.5,
+            mini_notification_lead: schedule_widgets.6,
+            long_notification_lead: schedule_widgets.7,
+            rest_interval: schedule_widgets.8,
+            rest_duration: schedule_widgets.9,
+            rest_after_longs: schedule_widgets.10,
+            rest_notification_lead: schedule_widgets.11,
+            mini_skip: action_widgets.0,
+            long_skip: action_widgets.1,
+            mini_postpone: action_widgets.2,
+            long_postpone: action_widgets.3,
+            rest_skip: action_widgets.10,
+            rest_postpone: action_widgets.11,
+            strict_mode: action_widgets.4,
+            strict_minimum: action_widgets.5,
+            allow_postpone_during_lockout: action_widgets.6,
+            inhibit_shortcuts: action_widgets.7,
+            manual_resume: action_widgets.8,
+            completion_sound: action_widgets.9,
+            display_mode: desktop_widgets.0,
+            content_selector: desktop_widgets.1,
+            opacity: desktop_widgets.2,
+            pointer_mode: desktop_widgets.3,
+            show_message: desktop_widgets.4,
+            idle_enabled: desktop_widgets.5,
+            idle_reset_after: desktop_widgets.6,
+            tray_enabled: desktop_widgets.7,
+            fullscreen_behavior: desktop_widgets.8,
+            fullscreen_max_delay: desktop_widgets.9,
+        }
+    }
+
+    fn collect_preview(&self, base: &AppConfig) -> AppConfig {
+        // Preview only consumes presentation fields. Keep persisted timing and
+        // policy values so unfinished edits elsewhere never block a preview.
         let mut config = base.clone();
+        config.completion.sound = completion_sound_from_index(self.completion_sound.selected());
+
+        config.display.mode = display_mode_from_index(self.display_mode.selected());
+        config.display.content_selector =
+            content_selector_from_index(self.content_selector.selected());
+        config.display.opacity = self.opacity.value();
+        config.display.pointer_mode = pointer_mode_from_index(self.pointer_mode.selected());
+        config.content.show_message = self.show_message.is_active();
+        config
+    }
+
+    fn collect(&self, base: &AppConfig) -> Result<AppConfig, String> {
+        let mut config = self.collect_preview(base);
         config.schedule.mini.interval = parse_duration(&self.mini_interval, "Mini interval")?;
         config.schedule.mini.duration = parse_duration(&self.mini_duration, "Mini duration")?;
         config.schedule.long.interval = parse_duration(&self.long_interval, "Long interval")?;
         config.schedule.long.duration = parse_duration(&self.long_duration, "Long duration")?;
-        config.schedule.long.after_minis = self.long_after_minis.value_as_int() as u32;
+        config.schedule.long.after_minis = self.long_after_minis.value() as u32;
         config.schedule.rest.interval = parse_duration(&self.rest_interval, "Rest interval")?;
         config.schedule.rest.duration = parse_duration(&self.rest_duration, "Rest duration")?;
-        config.schedule.rest.after_longs = self.rest_after_longs.value_as_int() as u32;
+        config.schedule.rest.after_longs = self.rest_after_longs.value() as u32;
 
         config.notifications.enabled = self.notifications_enabled.is_active();
-        config.notifications.mini_lead =
-            parse_duration(&self.mini_notification_lead, "Mini notification lead")?;
-        config.notifications.long_lead =
-            parse_duration(&self.long_notification_lead, "Long notification lead")?;
-        config.notifications.rest_lead =
-            parse_duration(&self.rest_notification_lead, "Rest notification lead")?;
+        if config.notifications.enabled {
+            config.notifications.mini_lead =
+                parse_duration(&self.mini_notification_lead, "Mini notification lead")?;
+            config.notifications.long_lead =
+                parse_duration(&self.long_notification_lead, "Long notification lead")?;
+            config.notifications.rest_lead =
+                parse_duration(&self.rest_notification_lead, "Rest notification lead")?;
+        }
 
         config.skip.mini.enabled = self.mini_skip.is_active();
         config.skip.long.enabled = self.long_skip.is_active();
@@ -170,23 +232,27 @@ impl SettingsWidgets {
         )?;
 
         config.strict.mode = strict_mode_from_index(self.strict_mode.selected());
-        config.strict.minimum_visible = parse_duration(&self.strict_minimum, "Strict-mode delay")?;
+        if config.strict.mode == StrictMode::Delay {
+            config.strict.minimum_visible =
+                parse_duration(&self.strict_minimum, "Strict-mode delay")?;
+        }
         config.strict.allow_postpone_during_lockout =
             self.allow_postpone_during_lockout.is_active();
         config.strict.inhibit_shortcuts = self.inhibit_shortcuts.is_active();
         config.completion.manual_resume = self.manual_resume.is_active();
-        config.completion.sound = completion_sound_from_index(self.completion_sound.selected());
-
-        config.display.mode = display_mode_from_index(self.display_mode.selected());
-        config.display.content_selector =
-            content_selector_from_index(self.content_selector.selected());
-        config.display.opacity = self.opacity.value();
-        config.display.pointer_mode = pointer_mode_from_index(self.pointer_mode.selected());
-        config.content.show_message = self.show_message.is_active();
 
         config.idle.enabled = self.idle_enabled.is_active();
-        config.idle.reset_after = parse_duration(&self.idle_reset_after, "Idle reset threshold")?;
+        if config.idle.enabled {
+            config.idle.reset_after =
+                parse_duration(&self.idle_reset_after, "Idle reset threshold")?;
+        }
         config.tray.enabled = self.tray_enabled.is_active();
+        config.fullscreen.behavior =
+            fullscreen_behavior_from_index(self.fullscreen_behavior.selected());
+        if config.fullscreen.behavior != FullscreenBehavior::Show {
+            config.fullscreen.max_delay =
+                parse_duration(&self.fullscreen_max_delay, "Maximum fullscreen delay")?;
+        }
 
         breakd_config::validate(&config).map_err(|error| error.to_string())?;
         Ok(config)
@@ -198,45 +264,11 @@ fn build_window(
     initial: AppConfig,
     instance: breakd_config::RuntimeInstance,
 ) -> gtk::ApplicationWindow {
-    let state = Rc::new(RefCell::new(initial.clone()));
     let (schedule_page, schedule_widgets) = schedule_page(&initial);
     let (actions_page, action_widgets) = actions_page(&initial);
     let (desktop_page, desktop_widgets) = desktop_page(&initial);
     let collaboration = collaboration_page(&initial);
-    let widgets = SettingsWidgets {
-        mini_interval: schedule_widgets.0,
-        mini_duration: schedule_widgets.1,
-        long_interval: schedule_widgets.2,
-        long_duration: schedule_widgets.3,
-        long_after_minis: schedule_widgets.4,
-        notifications_enabled: schedule_widgets.5,
-        mini_notification_lead: schedule_widgets.6,
-        long_notification_lead: schedule_widgets.7,
-        rest_interval: schedule_widgets.8,
-        rest_duration: schedule_widgets.9,
-        rest_after_longs: schedule_widgets.10,
-        rest_notification_lead: schedule_widgets.11,
-        mini_skip: action_widgets.0,
-        long_skip: action_widgets.1,
-        mini_postpone: action_widgets.2,
-        long_postpone: action_widgets.3,
-        rest_skip: action_widgets.10,
-        rest_postpone: action_widgets.11,
-        strict_mode: action_widgets.4,
-        strict_minimum: action_widgets.5,
-        allow_postpone_during_lockout: action_widgets.6,
-        inhibit_shortcuts: action_widgets.7,
-        manual_resume: action_widgets.8,
-        completion_sound: action_widgets.9,
-        display_mode: desktop_widgets.0,
-        content_selector: desktop_widgets.1,
-        opacity: desktop_widgets.2,
-        pointer_mode: desktop_widgets.3,
-        show_message: desktop_widgets.4,
-        idle_enabled: desktop_widgets.5,
-        idle_reset_after: desktop_widgets.6,
-        tray_enabled: desktop_widgets.7,
-    };
+    let widgets = SettingsWidgets::from_pages(schedule_widgets, action_widgets, desktop_widgets);
 
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
@@ -294,7 +326,17 @@ fn build_window(
     let save = gtk::Button::with_label("Save");
     save.add_css_class("suggested-action");
     save.set_tooltip_text(Some("Validate, save, and reload the configuration"));
+    let preview_overlay = gtk::Button::with_label("Preview overlay");
+    preview_overlay.set_tooltip_text(Some(
+        "Show an 8-second preview using the current settings without saving",
+    ));
+    let preview_sound = gtk::Button::with_label("Preview sound");
+    preview_sound.set_tooltip_text(Some("Play the selected completion sound without saving"));
+    connect_preview(&preview_overlay, widgets.clone(), status.clone(), false);
+    connect_preview(&preview_sound, widgets.clone(), status.clone(), true);
     let header = gtk::HeaderBar::new();
+    header.pack_start(&preview_overlay);
+    header.pack_start(&preview_sound);
     let window_title = format!("{} Settings", instance.name());
     header.set_title_widget(Some(&gtk::Label::new(Some(&window_title))));
     header.pack_end(&save);
@@ -308,9 +350,20 @@ fn build_window(
         .build();
     window.set_titlebar(Some(&header));
 
-    let state_for_save = state.clone();
     save.connect_clicked(move |button| {
-        let current = breakd_config::load().unwrap_or_else(|_| state_for_save.borrow().clone());
+        let current = match breakd_config::load() {
+            Ok(config) => config,
+            Err(error) => {
+                set_status(
+                    &status,
+                    &format!(
+                        "Could not read the current configuration; nothing was saved: {error}"
+                    ),
+                    true,
+                );
+                return;
+            }
+        };
         let config = match widgets.collect(&current) {
             Ok(config) => config,
             Err(error) => {
@@ -318,21 +371,16 @@ fn build_window(
                 return;
             }
         };
-        let restart_required = current.idle != config.idle;
         button.set_sensitive(false);
         set_status(&status, "Saving configuration...", false);
 
         let button = button.clone();
         let status = status.clone();
-        let state = state_for_save.clone();
         glib::spawn_future_local(async move {
-            let saved_config = config.clone();
-            let result =
-                gio::spawn_blocking(move || save_and_reload(&config, restart_required)).await;
+            let result = gio::spawn_blocking(move || save_and_reload(&config)).await;
             button.set_sensitive(true);
             match result {
                 Ok(Ok(message)) => {
-                    state.replace(saved_config);
                     set_status(&status, &message, false);
                 }
                 Ok(Err(error)) => set_status(&status, &error, true),
@@ -364,11 +412,11 @@ fn schedule_page(config: &AppConfig) -> (gtk::ScrolledWindow, SchedulePageWidget
     let mini_duration = duration_entry(config.schedule.mini.duration);
     let long_interval = duration_entry(config.schedule.long.interval);
     let long_duration = duration_entry(config.schedule.long.duration);
-    let long_after_minis = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+    let long_after_minis = gtk::SpinButton::with_range(1.0, f64::from(u32::MAX), 1.0);
     long_after_minis.set_value(f64::from(config.schedule.long.after_minis));
     let rest_interval = duration_entry(config.schedule.rest.interval);
     let rest_duration = duration_entry(config.schedule.rest.duration);
-    let rest_after_longs = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+    let rest_after_longs = gtk::SpinButton::with_range(1.0, f64::from(u32::MAX), 1.0);
     rest_after_longs.set_value(f64::from(config.schedule.rest.after_longs));
 
     let mini_group = settings_group(
@@ -695,6 +743,8 @@ type DesktopPageWidgets = (
     gtk::Switch,
     gtk::Entry,
     gtk::Switch,
+    gtk::DropDown,
+    gtk::Entry,
 );
 
 fn desktop_page(config: &AppConfig) -> (gtk::ScrolledWindow, DesktopPageWidgets) {
@@ -722,9 +772,10 @@ fn desktop_page(config: &AppConfig) -> (gtk::ScrolledWindow, DesktopPageWidgets)
         );
     });
 
-    let opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.2, 1.0, 0.05);
-    opacity.set_value(config.display.opacity);
+    let opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
     opacity.set_digits(2);
+    opacity.set_round_digits(-1);
+    opacity.set_value(config.display.opacity);
     opacity.set_value_pos(gtk::PositionType::Right);
     opacity.set_size_request(210, -1);
     let pointer_mode =
@@ -798,8 +849,39 @@ fn desktop_page(config: &AppConfig) -> (gtk::ScrolledWindow, DesktopPageWidgets)
         ],
     );
 
+    let fullscreen_behavior = gtk::DropDown::from_strings(&[
+        "Show breaks normally",
+        "Postpone while fullscreen",
+        "Notify while fullscreen",
+    ]);
+    fullscreen_behavior.set_selected(fullscreen_behavior_index(config.fullscreen.behavior));
+    let fullscreen_max_delay = duration_entry(config.fullscreen.max_delay);
+    fullscreen_max_delay.set_sensitive(config.fullscreen.behavior != FullscreenBehavior::Show);
+    let delay_for_behavior = fullscreen_max_delay.clone();
+    fullscreen_behavior.connect_selected_notify(move |dropdown| {
+        delay_for_behavior.set_sensitive(
+            fullscreen_behavior_from_index(dropdown.selected()) != FullscreenBehavior::Show,
+        );
+    });
+    let fullscreen_group = settings_group(
+        "Fullscreen activity",
+        "Hyprland fullscreen detection can defer scheduled breaks during presentations, videos, or games.",
+        &[
+            settings_row(
+                "During fullscreen",
+                "Choose whether to show, defer, or announce a due break.",
+                &fullscreen_behavior,
+            ),
+            settings_row(
+                "Maximum delay",
+                "A deferred break appears when fullscreen ends or this limit is reached.",
+                &fullscreen_max_delay,
+            ),
+        ],
+    );
+
     let advanced = gtk::Label::new(Some(
-        "Monitor identifiers, recovery policy, messages, and logging remain available in config.toml.",
+        "Monitor identifiers, recovery policy, messages, and logging remain available in config.toml. Logging changes require a daemon restart.",
     ));
     advanced.set_wrap(true);
     advanced.set_halign(gtk::Align::Start);
@@ -808,7 +890,12 @@ fn desktop_page(config: &AppConfig) -> (gtk::ScrolledWindow, DesktopPageWidgets)
     advanced_group.append(&advanced);
 
     (
-        settings_page(&[display_group, integration_group, advanced_group]),
+        settings_page(&[
+            display_group,
+            fullscreen_group,
+            integration_group,
+            advanced_group,
+        ]),
         (
             display_mode,
             content_selector,
@@ -818,6 +905,8 @@ fn desktop_page(config: &AppConfig) -> (gtk::ScrolledWindow, DesktopPageWidgets)
             idle_enabled,
             idle_reset_after,
             tray_enabled,
+            fullscreen_behavior,
+            fullscreen_max_delay,
         ),
     )
 }
@@ -1165,17 +1254,23 @@ fn load_coop_status() -> Result<CoopUiStatus, String> {
 }
 
 fn request_daemon(command: Command) -> Result<serde_json::Value, String> {
+    Ok(request_daemon_response(command)?
+        .data
+        .unwrap_or(serde_json::Value::Null))
+}
+
+fn request_daemon_response(command: Command) -> Result<breakd_core::Response, String> {
     let runtime = IPC_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map(Mutex::new)
-            .map_err(|error| format!("Could not initialize co-op IPC: {error}"))
+            .map_err(|error| format!("Could not initialize breakd IPC: {error}"))
     });
     let runtime = runtime.as_ref().map_err(Clone::clone)?;
     let runtime = runtime
         .lock()
-        .map_err(|_| "Co-op IPC became unavailable.".to_owned())?;
+        .map_err(|_| "Breakd IPC became unavailable.".to_owned())?;
     let response = runtime
         .block_on(async {
             tokio::time::timeout(
@@ -1189,7 +1284,7 @@ fn request_daemon(command: Command) -> Result<serde_json::Value, String> {
     if !response.ok {
         return Err(response.message);
     }
-    Ok(response.data.unwrap_or(serde_json::Value::Null))
+    Ok(response)
 }
 
 fn normalize_relay_input(input: &str) -> Result<String, String> {
@@ -1283,7 +1378,8 @@ fn postpone_controls(rule: &breakd_core::PostponeRule) -> (PostponeWidgets, Vec<
         .active(rule.max_postponements.is_some())
         .valign(gtk::Align::Center)
         .build();
-    let maximum = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+    let minimum = if rule.enabled { 1.0 } else { 0.0 };
+    let maximum = gtk::SpinButton::with_range(minimum, f64::from(u32::MAX), 1.0);
     maximum.set_value(f64::from(rule.max_postponements.unwrap_or(2)));
     let limit_controls = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     limit_controls.append(&maximum);
@@ -1299,6 +1395,7 @@ fn postpone_controls(rule: &breakd_core::PostponeRule) -> (PostponeWidgets, Vec<
         let active = toggle.is_active();
         duration_for_enabled.set_sensitive(active);
         limit_for_enabled.set_sensitive(active);
+        maximum_for_enabled.set_range(if active { 1.0 } else { 0.0 }, f64::from(u32::MAX));
         maximum_for_enabled.set_sensitive(active && limit_for_enabled.is_active());
     });
     let enabled_for_limit = enabled.clone();
@@ -1339,11 +1436,13 @@ fn update_postpone_rule(
     field_name: &str,
 ) -> Result<(), String> {
     rule.enabled = widgets.enabled.is_active();
-    rule.duration = parse_duration(&widgets.duration, field_name)?;
-    rule.max_postponements = widgets
-        .limit_enabled
-        .is_active()
-        .then(|| widgets.maximum.value_as_int() as u32);
+    if rule.enabled {
+        rule.duration = parse_duration(&widgets.duration, field_name)?;
+        rule.max_postponements = widgets
+            .limit_enabled
+            .is_active()
+            .then(|| widgets.maximum.value() as u32);
+    }
     Ok(())
 }
 
@@ -1487,9 +1586,9 @@ impl CadenceControls {
         let Some(mini) = entry_millis(&self.mini_interval) else {
             return;
         };
-        let long = aligned_interval(mini, self.long_after_minis.value_as_int() as u32);
+        let long = aligned_interval(mini, self.long_after_minis.value() as u32);
         set_duration_text(&self.long_interval, long);
-        let rest = aligned_interval(long, self.rest_after_longs.value_as_int() as u32);
+        let rest = aligned_interval(long, self.rest_after_longs.value() as u32);
         set_duration_text(&self.rest_interval, rest);
     }
 
@@ -1497,9 +1596,9 @@ impl CadenceControls {
         let cadence = entry_millis(&self.mini_interval).and_then(|mini| {
             cadence_preview(
                 mini,
-                self.long_after_minis.value_as_int() as u32,
+                self.long_after_minis.value() as u32,
                 entry_millis(&self.long_interval)?,
-                self.rest_after_longs.value_as_int() as u32,
+                self.rest_after_longs.value() as u32,
                 entry_millis(&self.rest_interval)?,
             )
         });
@@ -1580,30 +1679,112 @@ fn set_duration_text(entry: &gtk::Entry, millis: u64) {
     }
 }
 
-fn save_and_reload(config: &AppConfig, restart_required: bool) -> Result<String, String> {
+fn save_and_reload(config: &AppConfig) -> Result<String, String> {
     breakd_config::save(config).map_err(|error| error.to_string())?;
-    let executable = std::env::current_exe().map_err(|error| {
-        format!("Configuration was saved, but breakd could not reload: {error}")
-    })?;
-    let output = ProcessCommand::new(executable)
-        .arg("reload")
+    if !breakd_config::socket_path().exists() {
+        return Ok("Saved. Start the breakd daemon to apply the changes.".into());
+    }
+    let response = request_daemon_response(Command::Reload)
+        .map_err(|error| format!("Saved, but the daemon could not apply the changes: {error}"))?;
+    Ok(format!("Saved. {}", response.message))
+}
+
+fn connect_preview(
+    button: &gtk::Button,
+    widgets: SettingsWidgets,
+    status: gtk::Label,
+    sound: bool,
+) {
+    button.connect_clicked(move |button| {
+        let config = match breakd_config::load()
+            .map_err(|error| error.to_string())
+            .map(|base| widgets.collect_preview(&base))
+        {
+            Ok(config) => config,
+            Err(error) => {
+                set_status(&status, &error, true);
+                return;
+            }
+        };
+        button.set_sensitive(false);
+        set_status(
+            &status,
+            if sound {
+                "Playing the selected sound..."
+            } else {
+                "Previewing the current settings for 8 seconds. Press Escape or click to close."
+            },
+            false,
+        );
+        let button = button.clone();
+        let status = status.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || launch_preview(&config, sound)).await;
+            button.set_sensitive(true);
+            match result {
+                Ok(Ok(())) => set_status(
+                    &status,
+                    "Preview finished. Your settings and schedule were not changed.",
+                    false,
+                ),
+                Ok(Err(error)) => set_status(&status, &error, true),
+                Err(_) => set_status(&status, "Preview failed unexpectedly.", true),
+            }
+        });
+    });
+}
+
+fn launch_preview(config: &AppConfig, sound: bool) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = ProcessCommand::new(executable);
+    command.arg("preview").env(
+        "BREAKD_PREVIEW_CONFIG",
+        serde_json::to_string(config).map_err(|error| error.to_string())?,
+    );
+    if sound {
+        command.args(["--sound", completion_sound_name(config.completion.sound)]);
+    }
+    let output = command
         .output()
-        .map_err(|error| {
-            format!("Configuration was saved, but breakd could not reload: {error}")
-        })?;
-    if !output.status.success() {
+        .map_err(|error| format!("Could not start the preview: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
         let detail = String::from_utf8_lossy(&output.stderr);
         let detail = detail.trim();
-        return Ok(if detail.is_empty() {
-            "Saved. Start the breakd daemon to apply the changes.".into()
+        Err(if detail.is_empty() {
+            format!(
+                "Preview failed: the preview process exited with {}.",
+                output.status
+            )
         } else {
-            format!("Saved, but the daemon did not reload: {detail}")
-        });
+            format!("Preview failed: {detail}")
+        })
     }
-    if restart_required {
-        Ok("Saved and reloaded. Restart the daemon to apply idle-detection changes.".into())
-    } else {
-        Ok("Saved and applied.".into())
+}
+
+fn completion_sound_name(sound: CompletionSound) -> &'static str {
+    match sound {
+        CompletionSound::WarmRise => "warm-rise",
+        CompletionSound::SoftBloom => "soft-bloom",
+        CompletionSound::DeepHalo => "deep-halo",
+        CompletionSound::CleanChime => "clean-chime",
+    }
+}
+
+fn fullscreen_behavior_index(value: FullscreenBehavior) -> u32 {
+    match value {
+        FullscreenBehavior::Show => 0,
+        FullscreenBehavior::Postpone => 1,
+        FullscreenBehavior::NotifyOnly => 2,
+    }
+}
+
+fn fullscreen_behavior_from_index(value: u32) -> FullscreenBehavior {
+    match value {
+        1 => FullscreenBehavior::Postpone,
+        2 => FullscreenBehavior::NotifyOnly,
+        _ => FullscreenBehavior::Show,
     }
 }
 
@@ -1778,9 +1959,138 @@ mod tests {
 
     #[test]
     #[ignore = "requires a display server"]
-    fn cadence_alignment_survives_toggling_and_edits() {
+    fn settings_controls_preserve_values_and_cadence_alignment() {
         gtk::init().unwrap();
+        let mut external = breakd_config::defaults();
+        external.schedule.long.after_minis = u32::MAX;
+        external.schedule.rest.after_longs = u32::MAX - 1;
+        external.postpone.long.max_postponements = Some(u32::MAX);
+        external.postpone.mini.enabled = false;
+        external.postpone.mini.max_postponements = Some(0);
+        external.display.opacity = 0.12345;
+        breakd_config::validate(&external).unwrap();
+
+        // Saving unrelated settings must preserve every valid numeric value
+        // loaded from config.toml, including values beyond the usual UI range.
+        for value in [0.0, 0.12345, 1.0] {
+            external.display.opacity = value;
+            let (_, schedule) = schedule_page(&external);
+            let (_, actions) = actions_page(&external);
+            let (_, desktop) = desktop_page(&external);
+            let widgets = SettingsWidgets::from_pages(schedule, actions, desktop);
+            assert_eq!(widgets.collect(&external).unwrap(), external);
+            widgets.mini_postpone.enabled.set_active(true);
+            let enabled = widgets.collect(&external).unwrap();
+            assert_eq!(enabled.postpone.mini.max_postponements, Some(1));
+        }
+
         let config = breakd_config::defaults();
+        let (_, schedule) = schedule_page(&config);
+        let (_, actions) = actions_page(&config);
+        let (_, desktop) = desktop_page(&config);
+        let widgets = SettingsWidgets::from_pages(schedule, actions, desktop);
+        widgets.notifications_enabled.set_active(false);
+        widgets.idle_enabled.set_active(false);
+        widgets.mini_postpone.enabled.set_active(false);
+        widgets
+            .strict_mode
+            .set_selected(strict_mode_index(StrictMode::Off));
+        widgets
+            .fullscreen_behavior
+            .set_selected(fullscreen_behavior_index(FullscreenBehavior::Show));
+        for entry in [
+            &widgets.mini_notification_lead,
+            &widgets.long_notification_lead,
+            &widgets.rest_notification_lead,
+            &widgets.idle_reset_after,
+            &widgets.mini_postpone.duration,
+            &widgets.strict_minimum,
+            &widgets.fullscreen_max_delay,
+        ] {
+            entry.set_text("unfinished edit");
+        }
+        let collected = widgets.collect(&config).unwrap();
+        assert!(!collected.notifications.enabled && !collected.idle.enabled);
+        assert!(!collected.postpone.mini.enabled);
+        assert_eq!(
+            collected.notifications.mini_lead,
+            config.notifications.mini_lead
+        );
+        assert_eq!(
+            collected.notifications.long_lead,
+            config.notifications.long_lead
+        );
+        assert_eq!(
+            collected.notifications.rest_lead,
+            config.notifications.rest_lead
+        );
+        assert_eq!(collected.idle.reset_after, config.idle.reset_after);
+        assert_eq!(
+            collected.postpone.mini.duration,
+            config.postpone.mini.duration
+        );
+        assert_eq!(
+            collected.postpone.mini.max_postponements,
+            config.postpone.mini.max_postponements
+        );
+        assert_eq!(
+            collected.strict.minimum_visible,
+            config.strict.minimum_visible
+        );
+        assert_eq!(collected.fullscreen.max_delay, config.fullscreen.max_delay);
+        widgets.notifications_enabled.set_active(true);
+        assert!(widgets.collect(&config).is_err());
+        widgets.notifications_enabled.set_active(false);
+        widgets.idle_enabled.set_active(true);
+        assert!(widgets.collect(&config).is_err());
+        widgets.idle_enabled.set_active(false);
+        widgets.mini_postpone.enabled.set_active(true);
+        assert!(widgets.collect(&config).is_err());
+        widgets.mini_postpone.enabled.set_active(false);
+        widgets
+            .strict_mode
+            .set_selected(strict_mode_index(StrictMode::Delay));
+        assert!(widgets.collect(&config).is_err());
+        widgets
+            .strict_mode
+            .set_selected(strict_mode_index(StrictMode::Off));
+        widgets
+            .fullscreen_behavior
+            .set_selected(fullscreen_behavior_index(FullscreenBehavior::Postpone));
+        assert!(widgets.collect(&config).is_err());
+
+        widgets.mini_interval.set_text("unfinished schedule edit");
+        widgets.opacity.set_value(0.37);
+        widgets
+            .display_mode
+            .set_selected(display_mode_index(DisplayMode::Cursor));
+        widgets
+            .completion_sound
+            .set_selected(completion_sound_index(CompletionSound::DeepHalo));
+        widgets
+            .show_message
+            .set_active(!config.content.show_message);
+        let preview_config = widgets.collect_preview(&config);
+        breakd_config::validate(&preview_config).unwrap();
+        assert_eq!(preview_config.schedule, config.schedule);
+        assert_eq!(preview_config.notifications, config.notifications);
+        assert_eq!(preview_config.idle, config.idle);
+        assert_eq!(preview_config.strict, config.strict);
+        assert_eq!(preview_config.fullscreen, config.fullscreen);
+        assert_eq!(preview_config.display.mode, DisplayMode::Cursor);
+        assert_eq!(preview_config.display.opacity, 0.37);
+        assert_eq!(preview_config.completion.sound, CompletionSound::DeepHalo);
+        assert_eq!(
+            preview_config.content.show_message,
+            !config.content.show_message
+        );
+        assert!(
+            widgets
+                .collect(&config)
+                .unwrap_err()
+                .starts_with("Mini interval")
+        );
+
         let mini_interval = duration_entry(config.schedule.mini.interval);
         let long_interval = duration_entry(config.schedule.long.interval);
         let rest_interval = duration_entry(config.schedule.rest.interval);
@@ -1898,6 +2208,16 @@ mod tests {
             assert_eq!(strict_mode_from_index(strict_mode_index(value)), value);
         }
         for value in [
+            FullscreenBehavior::Show,
+            FullscreenBehavior::Postpone,
+            FullscreenBehavior::NotifyOnly,
+        ] {
+            assert_eq!(
+                fullscreen_behavior_from_index(fullscreen_behavior_index(value)),
+                value
+            );
+        }
+        for value in [
             CompletionSound::WarmRise,
             CompletionSound::SoftBloom,
             CompletionSound::DeepHalo,
@@ -1906,6 +2226,10 @@ mod tests {
             assert_eq!(
                 completion_sound_from_index(completion_sound_index(value)),
                 value
+            );
+            assert_eq!(
+                serde_json::to_value(value).unwrap(),
+                completion_sound_name(value)
             );
         }
     }

@@ -316,7 +316,6 @@ pub struct FullscreenConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupConfig {
     pub start_paused: bool,
-    pub recover_state: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,12 +518,24 @@ pub struct OutputInfo {
 #[serde(tag = "command", content = "args", rename_all = "kebab-case")]
 pub enum Command {
     Status,
-    Pause { duration: Option<DurationMs> },
+    Pause {
+        duration: Option<DurationMs>,
+    },
     Resume,
     ResumeBreak,
     Reset,
     Skip,
     Postpone,
+    StartDue {
+        due_id: DueBreakId,
+    },
+    PostponeDue {
+        due_id: DueBreakId,
+    },
+    OverlayReady {
+        session_id: BreakSessionId,
+        ready_token: BreakSessionId,
+    },
     Mini,
     Long,
     Rest,
@@ -532,8 +543,12 @@ pub enum Command {
     Reload,
     Outputs,
     Doctor,
-    CoopHost { relay_url: String },
-    CoopJoin { invite: String },
+    CoopHost {
+        relay_url: String,
+    },
+    CoopJoin {
+        invite: String,
+    },
     CoopLeave,
     CoopStatus,
 }
@@ -557,6 +572,10 @@ pub struct Response {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverlaySpec {
     pub session_id: BreakSessionId,
+    #[serde(default)]
+    pub ready_token: Option<BreakSessionId>,
+    #[serde(default)]
+    pub preview: bool,
     pub kind: BreakKind,
     pub duration: DurationMs,
     pub strict_remaining: DurationMs,
@@ -579,6 +598,43 @@ mod tests {
     fn duration_accepts_human_text() {
         let value: DurationMs = serde_json::from_str("\"2m 5s\"").unwrap();
         assert_eq!(value.as_millis(), 125_000);
+    }
+
+    #[test]
+    fn legacy_overlay_specs_default_to_no_readiness_token_or_preview() {
+        let spec: OverlaySpec = serde_json::from_value(serde_json::json!({
+            "session_id": BreakSessionId::new(),
+            "kind": "mini",
+            "duration": "1s",
+            "strict_remaining": "0ms",
+            "can_skip": true,
+            "can_postpone": true,
+            "manual_resume": false,
+            "message": null,
+            "socket_path": "/tmp/breakd.sock"
+        }))
+        .unwrap();
+        assert_eq!(spec.ready_token, None);
+        assert!(!spec.preview);
+    }
+
+    #[test]
+    fn overlay_readiness_requires_a_per_attempt_token() {
+        let session_id = BreakSessionId::new();
+        let mut command = serde_json::json!({
+            "command": "overlay-ready",
+            "args": { "session_id": session_id }
+        });
+        assert!(serde_json::from_value::<Command>(command.clone()).is_err());
+        let ready_token = BreakSessionId::new();
+        command["args"]["ready_token"] = serde_json::to_value(ready_token).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Command>(command).unwrap(),
+            Command::OverlayReady {
+                session_id,
+                ready_token
+            }
+        );
     }
 
     #[test]
