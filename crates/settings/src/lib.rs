@@ -348,6 +348,7 @@ fn build_window(
         .default_height(720)
         .child(&root)
         .build();
+    window.add_css_class("breakd-settings");
     window.set_titlebar(Some(&header));
 
     save.connect_clicked(move |button| {
@@ -1888,56 +1889,142 @@ fn pointer_mode_from_index(value: u32) -> PointerMode {
 }
 
 fn install_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+
+    // Themes that do not define the standard named colors would otherwise
+    // leave the rules below unresolved. Providers at fallback priority only
+    // apply when the active theme does not define the same color.
+    let fallback_colors = gtk::CssProvider::new();
+    fallback_colors.load_from_string(
         r#"
-        .settings-intro-title {
+        @define-color theme_fg_color #1f2328;
+        @define-color theme_bg_color #f6f7f8;
+        @define-color theme_base_color #ffffff;
+        @define-color theme_selected_bg_color #1c63c4;
+        @define-color theme_selected_fg_color #ffffff;
+        @define-color error_color #b3261e;
+        "#,
+    );
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &fallback_colors,
+        gtk::STYLE_PROVIDER_PRIORITY_FALLBACK,
+    );
+
+    // Every button rule shares this prefix so state and action variants only
+    // differ in specificity by the class or pseudo-class they add.
+    let button = "window.breakd-settings button:not(.flat):not(.link):not(.close)\
+                  :not(.minimize):not(.maximize):not(.up):not(.down)";
+    let css = format!(
+        r#"
+        window.breakd-settings {{
+            color: @theme_fg_color;
+            background-color: @theme_bg_color;
+        }}
+        {button} {{
+            color: @theme_fg_color;
+            background-color: mix(@theme_bg_color, @theme_fg_color, 0.08);
+            background-image: none;
+            border: 1px solid alpha(@theme_fg_color, 0.24);
+            box-shadow: none;
+            text-shadow: none;
+            -gtk-icon-shadow: none;
+        }}
+        {button}:hover {{
+            background-color: mix(@theme_bg_color, @theme_fg_color, 0.14);
+            border-color: alpha(@theme_fg_color, 0.36);
+        }}
+        {button}:active,
+        {button}:checked {{
+            background-color: mix(@theme_bg_color, @theme_fg_color, 0.22);
+        }}
+        {button}.suggested-action {{
+            color: @theme_selected_fg_color;
+            background-color: @theme_selected_bg_color;
+            border-color: shade(@theme_selected_bg_color, 0.85);
+        }}
+        {button}.suggested-action:hover {{
+            background-color: shade(@theme_selected_bg_color, 1.08);
+        }}
+        {button}.suggested-action:active {{
+            background-color: shade(@theme_selected_bg_color, 0.9);
+        }}
+        {button}.destructive-action {{
+            color: @error_color;
+            font-weight: 600;
+            border-color: alpha(@error_color, 0.6);
+        }}
+        {button}:disabled,
+        {button}.suggested-action:disabled,
+        {button}.destructive-action:disabled {{
+            color: alpha(@theme_fg_color, 0.5);
+            background-color: mix(@theme_bg_color, @theme_fg_color, 0.04);
+            border-color: alpha(@theme_fg_color, 0.14);
+        }}
+        window.breakd-settings button:focus-visible {{
+            outline: 2px solid alpha(@theme_selected_bg_color, 0.8);
+            outline-offset: 1px;
+        }}
+        window.breakd-settings button label {{
+            color: inherit;
+        }}
+        window.breakd-settings spinbutton > button.up,
+        window.breakd-settings spinbutton > button.down {{
+            color: @theme_fg_color;
+        }}
+        window.breakd-settings spinbutton > button.up:disabled,
+        window.breakd-settings spinbutton > button.down:disabled {{
+            color: alpha(@theme_fg_color, 0.4);
+        }}
+        .settings-intro-title {{
             font-size: 1.35em;
             font-weight: 700;
-        }
-        .settings-section-title {
+        }}
+        .settings-section-title {{
             font-size: 1.08em;
             font-weight: 700;
-        }
-        .settings-description {
+        }}
+        .settings-description {{
             opacity: 0.72;
-        }
-        .settings-list {
+        }}
+        .settings-list {{
             background-color: alpha(@theme_fg_color, 0.045);
             border: 1px solid alpha(@theme_fg_color, 0.14);
             border-radius: 8px;
-        }
-        .settings-row {
+        }}
+        .settings-row {{
             padding: 13px 16px;
             min-height: 42px;
-        }
-        .settings-status-bar {
+        }}
+        .settings-status-bar {{
             border-top: 1px solid alpha(@theme_fg_color, 0.12);
-        }
-        .settings-status {
+        }}
+        .settings-status {{
             padding: 10px 16px;
             opacity: 0.78;
-        }
-        .settings-error {
+        }}
+        .settings-error {{
             color: @error_color;
             opacity: 1;
-        }
-        .settings-update-link {
+        }}
+        .settings-update-link {{
             padding: 0;
             min-height: 0;
-        }
-        .settings-secret {
+        }}
+        .settings-secret {{
             font-family: monospace;
-        }
-        "#,
+        }}
+        "#
     );
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(&css);
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
 }
 
 #[cfg(test)]

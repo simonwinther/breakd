@@ -841,13 +841,55 @@ fn install_css(config: &AppConfig) {
         r#"
         .breakd-overlay {{
             background-color: rgba({red}, {green}, {blue}, {opacity});
+            background-image: none;
             color: #f4f7f8;
         }}
         .breakd-panel {{
             background-color: rgba(20, 24, 28, 0.94);
+            background-image: none;
             border: 1px solid rgba(255, 255, 255, 0.18);
             border-radius: 8px;
             padding: 36px 42px;
+            color: #f4f7f8;
+        }}
+        .breakd-panel label {{
+            color: #f4f7f8;
+            background: none;
+            text-shadow: none;
+        }}
+        .breakd-panel .breakd-resume,
+        .breakd-panel .breakd-message {{
+            color: #d5dce0;
+        }}
+        .breakd-panel button.breakd-action {{
+            color: #f4f7f8;
+            background-color: #2f3a44;
+            background-image: none;
+            border: 1px solid rgba(255, 255, 255, 0.32);
+            border-radius: 6px;
+            box-shadow: none;
+            text-shadow: none;
+            outline: none;
+        }}
+        .breakd-panel button.breakd-action label {{
+            color: inherit;
+        }}
+        .breakd-panel button.breakd-action:hover {{
+            background-color: #3c4a57;
+            border-color: rgba(255, 255, 255, 0.5);
+        }}
+        .breakd-panel button.breakd-action:active,
+        .breakd-panel button.breakd-action:checked {{
+            background-color: #4a5b6b;
+        }}
+        .breakd-panel button.breakd-action:focus-visible {{
+            outline: 2px solid #8cc8ff;
+            outline-offset: 2px;
+        }}
+        .breakd-panel button.breakd-action:disabled {{
+            color: #9aa5ad;
+            background-color: #262e35;
+            border-color: rgba(255, 255, 255, 0.16);
         }}
         .breakd-panel-compact {{
             padding: 20px 24px;
@@ -867,10 +909,12 @@ fn install_css(config: &AppConfig) {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(&css);
     if let Some(display) = gdk::Display::default() {
+        // The overlay uses a fixed dark palette, so it must also win over
+        // user stylesheets such as ~/.config/gtk-4.0/gtk.css.
         gtk::style_context_add_provider_for_display(
             &display,
             &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
         );
     }
 }
