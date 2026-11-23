@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.13](https://github.com/simonwinther/breakd/compare/v0.1.12...v0.1.13) (2026-11-23)
+
+
+### Features
+
+* **breakd:** improve break reminders ([c69f9b0](https://github.com/simonwinther/breakd/commit/c69f9b013c96de40469586cfdf6dd863b38b950f))
+
+
+### Bug Fixes
+
+* **ui:** keep settings and overlay readable ([5da063d](https://github.com/simonwinther/breakd/commit/5da063d3786adac39b17a47a355a55af0677c893)), closes [#20](https://github.com/simonwinther/breakd/issues/20)
+
 ## [0.1.12](https://github.com/simonwinther/breakd/compare/v0.1.11...v0.1.12) (2026-07-15)
 
 
